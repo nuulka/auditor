@@ -1,0 +1,4 @@
+tmp/
+.opencode/
+*.bak
+*.log
