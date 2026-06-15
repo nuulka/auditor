@@ -1,4 +1,6 @@
 tmp/
 .opencode/
+all_transactions/
+MiskolcA.code-workspace
 *.bak
 *.log
