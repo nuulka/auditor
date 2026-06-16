@@ -20,32 +20,45 @@
         <h2>📖 Revizor Panel - Használati Útmutató</h2>
         <p class="lead">Ez a bankegyeztető rendszer kifejezetten a banki kivonatok és az OTS könyvelési adatok gyors, precíz összevetésére készült.</p>
 
-        <h4>1. Adatfeltöltési fázis (feltolto.php)</h4>
+        <div class="mb-4 p-3 bg-light rounded border">
+            <h6 class="mb-2">🔗 Ugrás a fejezetekhez:</h6>
+            <a href="#feltoltes" class="btn btn-sm btn-outline-primary me-1">1. Adatfeltöltés</a>
+            <a href="#egyeztetes" class="btn btn-sm btn-outline-primary me-1">2. Ellenőrzés/Egyeztetés</a>
+            <a href="#admin" class="btn btn-sm btn-outline-primary me-1">3. Jóváhagyás/Admin</a>
+            <a href="#tippek" class="btn btn-sm btn-outline-primary">💡 Tippek</a>
+        </div>
+
+        <h4 id="feltoltes">1. Adatfeltöltési fázis <small class="text-muted">(feltolto.php)</small> <a href="#feltoltes" class="text-decoration-none ms-1" style="font-size:14px;">🔗</a></h4>
         <div class="step-box">
             <ul>
                 <li><strong>Egyedi gyülekezet feltöltése:</strong> Ha egy konkrét egység kivonatát kaptad meg. Válaszd ki a nevet/ID-t a listából, és töltsd fel a CSV-t.</li>
                 <li><strong>Tömeges (Automatikus) feltöltés:</strong> A leghatékonyabb mód. A rendszer a <code>szamlak.php</code>-ban rögzített adatok alapján automatikusan felismeri, melyik tétel melyik gyülekezethez tartozik.</li>
                 <li><strong>Emberbarát nevek:</strong> A kód a banki kódokat és generikus neveket (pl. HETEDNAPI ADVENTISTA EGYHÁZ) automatikusan lecseréli a valódi gyülekezetnevekre a tudástár alapján.</li>
             </ul>
+            <div class="text-end"><a href="#" class="small text-muted">↑ Vissza a tetejére</a></div>
         </div>
 
-        <h4>2. Ellenőrzés és Egyeztetés (index.php)</h4>
+        <h4 id="egyeztetes">2. Ellenőrzés és Egyeztetés <small class="text-muted">(index.php)</small> <a href="#egyeztetes" class="text-decoration-none ms-1" style="font-size:14px;">🔗</a></h4>
         <div class="step-box">
             <ul>
                 <li><strong>Gyülekezet választás:</strong> A gyorsaság érdekében először válassz egy gyülekezetet a fejlécben. Ekkor csak az adott egység adatai töltődnek be (szerveroldali optimalizálás).</li>
                 <li><strong>Automata Robot:</strong> A <strong>Progresszív mód</strong> először a 100%-os (0 napos) egyezéseket keresi és zárja le, majd tágítja az időablakot, végül intelligens szöveges keresővel párosít.</li>
                 <li><strong>Kézi nyomozás:</strong> Ha egy összegnek nincs párja, a Modal ablakban rákereshetsz az összegre a teljes OTS adatbázisban (minden gyülekezetnél), hátha máshova könyvelték.</li>
             </ul>
+            <div class="text-end"><a href="#" class="small text-muted">↑ Vissza a tetejére</a></div>
         </div>
 
-        <h4>3. Jóváhagyás és Adminisztráció</h4>
+        <h4 id="admin">3. Jóváhagyás és Adminisztráció <a href="#admin" class="text-decoration-none ms-1" style="font-size:14px;">🔗</a></h4>
         <div class="step-box">
             <ul>
                 <li><strong>Párhuzamos nézet (Modal):</strong> Bármely tételre kattintva egymás mellett látod a banki és OTS adatokat (Dátum, Összeg, Megjegyzés, Rögzítő neve).</li>
                 <li><strong>Tömeges OKézés:</strong> A képernyőn látható [IDŐ CSÚSZÁS] státuszú tételeket egyetlen gombbal elfogadhatod.</li>
                 <li><strong>Excel Export:</strong> A leszűrt listát bármikor letöltheted CSV formátumban további elemzéshez.</li>
             </ul>
+            <div class="text-end"><a href="#" class="small text-muted">↑ Vissza a tetejére</a></div>
         </div>
+
+        <div id="tippek" class="tip-box">
 
         <div class="tip-box">
             <h5>💡 Gyors-tippek:</h5>

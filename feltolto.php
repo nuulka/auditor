@@ -102,6 +102,19 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['
     exit;
 }
 
+// Server-side session check AJAX
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['action'] === 'check_session') {
+    header('Content-Type: application/json');
+    $remaining = isset($_SESSION['revizor_expires_at']) ? $_SESSION['revizor_expires_at'] - time() : 0;
+    if ($remaining <= 0) {
+        session_destroy();
+        echo json_encode(['status' => 'EXPIRED']);
+    } else {
+        echo json_encode(['status' => 'OK', 'remaining' => $remaining]);
+    }
+    exit;
+}
+
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     if (!isset($_POST['csrf_token']) || $_POST['csrf_token'] !== $_SESSION['csrf_token']) {
         $message = "<div class='alert alert-danger'>CSRF token mismatch!</div>";
@@ -410,13 +423,15 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     </div>
 </div>
 <script>
-document.querySelectorAll('form').forEach(function(form) {
-    form.addEventListener('submit', function() {
-        document.getElementById('loadingOverlay').classList.add('show');
-        var start = Date.now();
-        setInterval(function() {
-            document.getElementById('loadingTimer').innerText = ((Date.now() - start) / 1000).toFixed(1) + 's';
-        }, 100);
+document.addEventListener('DOMContentLoaded', function() {
+    document.querySelectorAll('form').forEach(function(form) {
+        form.addEventListener('submit', function() {
+            document.getElementById('loadingOverlay').classList.add('show');
+            var start = Date.now();
+            setInterval(function() {
+                document.getElementById('loadingTimer').innerText = ((Date.now() - start) / 1000).toFixed(1) + 's';
+            }, 100);
+        });
     });
 });
 </script>
@@ -478,7 +493,7 @@ function formatTime(sec) {
 
 function checkSession() {
     sessionRemaining--;
-    if (sessionRemaining <= 60 && !sessionWarningShown) {
+    if (sessionRemaining <= 300 && !sessionWarningShown) {
         sessionWarningShown = true;
         document.getElementById('sessionWarnTime').textContent = formatTime(sessionRemaining);
         new bootstrap.Modal(document.getElementById('sessionWarnModal')).show();
@@ -486,6 +501,26 @@ function checkSession() {
     if (sessionRemaining <= 0) {
         window.location.href = 'login.php';
     }
+}
+
+function checkSessionServer() {
+    var data = new FormData();
+    data.append('action', 'check_session');
+    fetch('feltolto.php', { method: 'POST', body: data })
+    .then(function(res) { return res.json(); })
+    .then(function(result) {
+        if (result.status === 'EXPIRED') {
+            window.location.href = 'login.php';
+        } else if (result.status === 'OK') {
+            sessionRemaining = result.remaining;
+            if (sessionRemaining > 300 && sessionWarningShown) {
+                sessionWarningShown = false;
+                var modal = bootstrap.Modal.getInstance(document.getElementById('sessionWarnModal'));
+                if (modal) modal.hide();
+            }
+        }
+    })
+    .catch(function() {});
 }
 
 function extendSession() {
@@ -505,6 +540,7 @@ function extendSession() {
 }
 
 setInterval(checkSession, 1000);
+setInterval(checkSessionServer, 10000);
 </script>
 
 <!-- SESSION WARNING MODAL -->
@@ -515,7 +551,7 @@ setInterval(checkSession, 1000);
         <h6 class="modal-title">⏰ Session lejár</h6>
       </div>
       <div class="modal-body text-center">
-        <p class="mb-2">A munkamenet <strong>1 percen belül</strong> lejár!</p>
+        <p class="mb-2">A munkamenet <strong>5 percen belül</strong> lejár!</p>
         <p class="text-muted small mb-0">Hátralévő idő: <strong id="sessionWarnTime">-</strong></p>
       </div>
       <div class="modal-footer justify-content-center">
