@@ -19,6 +19,12 @@ if (!isset($_SESSION[GC_LOGIN_COOKIE])) {
     exit;
 }
 
+// Load common auth helpers and user context
+require_once __DIR__ . '/lib/bootstrap.php';
+require_once __DIR__ . '/lib/auth.php';
+// populate accessible churches for the session
+build_user_context_from_ots();
+
 if (empty($_SESSION['csrf_token'])) {
     $_SESSION['csrf_token'] = bin2hex(random_bytes(32));
 }
@@ -80,6 +86,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['
         if ($church_id <= 0) {
             echo json_encode(['status' => 'ERROR', 'message' => 'Invalid church_id']);
             exit;
+        }
+        // only admin can list custom patterns for arbitrary church; revizor can list for own churches
+        if (!is_admin()) {
+            // check requested church is in accessible list
+            require_church_access($church_id);
         }
         $res = $conn->query("SELECT id, church_id, bank_pattern, ots_pattern, label FROM custom_patterns WHERE church_id = $church_id ORDER BY id");
         $items = [];
@@ -289,10 +300,13 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['
         } else {
             if (!empty($ots_doc_input)) {
                 // Kézi bizonylatszám párosítás
-                $row_q = $conn->query("SELECT church_id FROM bank_reconciliation WHERE id=$id");
-                if ($row_q && $row_q->num_rows > 0) {
-                    $r = $row_q->fetch_assoc();
-                    $c_id = $r['church_id'];
+                    $row_q = $conn->query("SELECT church_id FROM bank_reconciliation WHERE id=$id");
+                    if ($row_q && $row_q->num_rows > 0) {
+                        $r = $row_q->fetch_assoc();
+                        $c_id = $r['church_id'];
+
+                    // ensure user has access to this church
+                    require_church_access(intval($c_id));
 
                     // Megkeressük az OTS-ben a bizonylatot (akár bank, akár pénztár)
                     $ots_query = "SELECT DATE(MAX(DATETIME)) as ots_date, SUM(IF(T.TYPE IN ($exp_types_str), -1 * T.AMOUNT, T.AMOUNT)) as ots_amount 
@@ -375,6 +389,17 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['
     if (is_array($ids) && count($ids) > 0) {
         $ids_str = implode(',', array_map('intval', $ids));
         $user = $_SESSION[GC_USER_FULL_NAME] ?? 'Ismeretlen';
+        // Scope check: ensure all records belong to accessible churches for non-admins
+        if (!is_admin()) {
+            $chk = $conn->query("SELECT DISTINCT church_id FROM bank_reconciliation WHERE id IN ($ids_str)");
+            $allowed = get_accessible_church_ids();
+            while ($rowchk = $chk->fetch_assoc()) {
+                if (!in_array(intval($rowchk['church_id']), $allowed, true)) {
+                    echo json_encode(['status' => 'ERROR', 'message' => 'Forbidden: some records are outside your scope']);
+                    exit;
+                }
+            }
+        }
         $sql = "UPDATE bank_reconciliation SET status = 'OK', updated_by = '".$conn->real_escape_string($user)."' WHERE id IN ($ids_str) AND status = 'CSUSZAS'";
         if ($conn->query($sql)) {
             echo json_encode(['status' => 'OK', 'count' => $conn->affected_rows]);

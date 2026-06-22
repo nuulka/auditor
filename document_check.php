@@ -15,6 +15,11 @@ $conn = new mysqli('localhost', 'root', '', 'revizor_db');
 if ($conn->connect_error) { die("Database connection failed"); }
 $conn->set_charset("utf8mb4");
 
+require_once __DIR__ . '/../lib/bootstrap.php';
+require_once __DIR__ . '/../lib/auth.php';
+// ensure user context built
+build_user_context_from_ots();
+
 $church_id = isset($_GET['church_id']) ? intval($_GET['church_id']) : 0;
 $date_from = isset($_GET['date_from']) ? trim($_GET['date_from']) : '';
 $date_to = isset($_GET['date_to']) ? trim($_GET['date_to']) : '';
@@ -26,6 +31,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['
         echo json_encode(['status' => 'ERROR', 'message' => 'CSRF token mismatch']); exit;
     }
     $bank_rec_id = intval($_POST['bank_reconciliation_id'] ?? 0);
+    // scope check
+    require_church_access((int)($conn->query("SELECT church_id FROM bank_reconciliation WHERE id = $bank_rec_id")->fetch_assoc()['church_id'] ?? 0));
     if ($bank_rec_id <= 0) { echo json_encode(['status' => 'ERROR', 'message' => 'Hiányzó ID']); exit; }
     $fields = ['cash_voucher_ok','date_filled','amount_ok','description_ok','signature_treasurer','signature_receiver','signature_authorizer','invoice_ok','tithe_card_ok','receipt_number_ok','decision_number_ok','fund_designation_ok','supporting_doc_ok'];
     $set_parts = [];

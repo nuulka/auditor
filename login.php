@@ -13,6 +13,28 @@ if (isset($_GET['check'])) {
 if (session_status() != PHP_SESSION_ACTIVE) { session_start(); }
 $just_logged_in = isset($_GET['ots_ready']) && isset($_SESSION[GC_LOGIN_COOKIE]);
 if ($just_logged_in) {
+    // build revizor user context from OTS roles
+    try {
+        require_once __DIR__ . '/lib/bootstrap.php';
+        require_once __DIR__ . '/lib/auth.php';
+        // populate accessible churches from OTS ROLES
+        build_user_context_from_ots();
+        // set app role into session
+        if (is_admin()) {
+            $_SESSION['revizor_app_role'] = 'admin';
+        } elseif (is_revizor()) {
+            $_SESSION['revizor_app_role'] = 'revizor';
+        } else {
+            $_SESSION['revizor_app_role'] = 'user';
+        }
+        // if user has exactly one accessible church, set selected
+        $acs = get_accessible_church_ids();
+        if (is_array($acs) && count($acs) === 1) {
+            $_SESSION['revizor_selected_church'] = $acs[0];
+        }
+    } catch (Throwable $e) {
+        // ignore, fall back to default redirect
+    }
     header('Location: index.php');
     exit;
 }
