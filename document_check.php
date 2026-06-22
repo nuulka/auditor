@@ -15,8 +15,8 @@ $conn = new mysqli('localhost', 'root', '', 'revizor_db');
 if ($conn->connect_error) { die("Database connection failed"); }
 $conn->set_charset("utf8mb4");
 
-require_once __DIR__ . '/../lib/bootstrap.php';
-require_once __DIR__ . '/../lib/auth.php';
+require_once __DIR__ . '/lib/bootstrap.php';
+require_once __DIR__ . '/lib/auth.php';
 // ensure user context built
 build_user_context_from_ots();
 

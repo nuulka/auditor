@@ -20,8 +20,8 @@ if (!isset($_SESSION[GC_LOGIN_COOKIE])) {
 }
 
 // Access control: only admin can use upload interface
-require_once __DIR__ . '/../lib/bootstrap.php';
-require_once __DIR__ . '/../lib/auth.php';
+require_once __DIR__ . '/lib/bootstrap.php';
+require_once __DIR__ . '/lib/auth.php';
 if (!is_admin()) {
     // simple redirect for non-admins
     header('Location: index.php');

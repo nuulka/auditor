@@ -7,8 +7,8 @@ $_SESSION[GN_LAST_ACTIVE] = time();
 require_once __DIR__ . '/../ots/session_handler.php';
 if (!isset($_SESSION[GC_LOGIN_COOKIE])) { header('Content-Type: application/json'); echo json_encode(['error' => 'Nincs bejelentkezve']); exit; }
 
-require_once __DIR__ . '/../lib/bootstrap.php';
-require_once __DIR__ . '/../lib/auth.php';
+require_once __DIR__ . '/lib/bootstrap.php';
+require_once __DIR__ . '/lib/auth.php';
 
 $conn = get_revizor_conn();
 if ($conn->connect_error) { header('Content-Type: application/json'); echo json_encode(['error' => 'DB hiba']); exit; }
