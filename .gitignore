@@ -1,6 +1,17 @@
+# Revizor Asszisztens – .gitignore
+
+# Development helpers
+_dev/
+
+# Temp files
 tmp/
-.opencode/
-all_transactions/
-MiskolcA.code-workspace
-*.bak
-*.log
+
+# OS
+Thumbs.db
+.DS_Store
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo

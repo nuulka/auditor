@@ -1,0 +1,417 @@
+<!DOCTYPE html>
+<html lang="hu">
+<head>
+    <meta charset="UTF-8">
+    <title>Revizor Asszisztens 1.0 — Dokumentáció</title>
+    <style>
+        @page {
+            size: A4;
+            margin: 2cm 2.2cm;
+        }
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: 'Segoe UI', 'Helvetica Neue', Arial, sans-serif;
+            color: #1a1a1a;
+            line-height: 1.55;
+            font-size: 11pt;
+        }
+        h1 {
+            font-size: 22pt;
+            color: #1a3a5c;
+            border-bottom: 3px solid #1a3a5c;
+            padding-bottom: 10px;
+            margin-bottom: 20px;
+            margin-top: 0;
+        }
+        h2 {
+            font-size: 15pt;
+            color: #1a3a5c;
+            margin-top: 28px;
+            margin-bottom: 12px;
+            padding-bottom: 4px;
+            border-bottom: 1px solid #c0c8d4;
+        }
+        h3 {
+            font-size: 12.5pt;
+            color: #2a4a6c;
+            margin-top: 20px;
+            margin-bottom: 8px;
+        }
+        h4 {
+            font-size: 11.5pt;
+            color: #3a5a7c;
+            margin-top: 16px;
+            margin-bottom: 6px;
+        }
+        p { margin-bottom: 9px; }
+        ul, ol { margin: 6px 0 10px 20px; }
+        li { margin-bottom: 4px; }
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            margin: 14px 0;
+            font-size: 10.5pt;
+        }
+        th {
+            background: #1a3a5c;
+            color: #fff;
+            padding: 8px 10px;
+            text-align: left;
+            font-weight: 600;
+        }
+        td {
+            padding: 7px 10px;
+            border-bottom: 1px solid #d0d4dc;
+        }
+        tr:nth-child(even) td { background: #f4f6f9; }
+        .cover {
+            text-align: center;
+            padding: 80px 0 50px 0;
+            page-break-after: always;
+        }
+        .cover h1 {
+            font-size: 30pt;
+            border: none;
+            margin-bottom: 8px;
+        }
+        .cover .subtitle {
+            font-size: 14pt;
+            color: #4a6a8c;
+            margin-bottom: 30px;
+        }
+        .cover .meta {
+            font-size: 10.5pt;
+            color: #7a7a7a;
+        }
+        .cover .icon { font-size: 60px; margin-bottom: 20px; }
+        .divider {
+            border: none;
+            border-top: 1px solid #d0d4dc;
+            margin: 18px 0;
+        }
+        .highlight-box {
+            background: #e8f0f8;
+            border-left: 4px solid #1a3a5c;
+            padding: 12px 16px;
+            margin: 14px 0;
+            border-radius: 0 4px 4px 0;
+        }
+        .highlight-box strong { color: #1a3a5c; }
+        .success-box {
+            background: #e8f5e9;
+            border-left: 4px solid #2e7d32;
+            padding: 12px 16px;
+            margin: 14px 0;
+            border-radius: 0 4px 4px 0;
+        }
+        .success-box strong { color: #2e7d32; }
+        .two-col {
+            display: flex;
+            gap: 20px;
+            margin: 14px 0;
+        }
+        .two-col > div { flex: 1; }
+        .two-col table { margin: 0; }
+        .section-toc { margin: 20px 0; }
+        .section-toc a { color: #1a3a5c; text-decoration: none; }
+        .section-toc a:hover { text-decoration: underline; }
+        .section-toc li { margin-bottom: 6px; }
+        .page-break { page-break-before: always; }
+        strong { color: #1a1a1a; }
+        code {
+            font-family: 'Consolas', 'Courier New', monospace;
+            font-size: 9.5pt;
+            background: #eef0f4;
+            padding: 1px 4px;
+            border-radius: 3px;
+        }
+        .tag {
+            display: inline-block;
+            background: #1a3a5c;
+            color: #fff;
+            font-size: 8pt;
+            padding: 2px 8px;
+            border-radius: 10px;
+            margin-right: 4px;
+        }
+        .tag.green { background: #2e7d32; }
+        .tag.orange { background: #e65100; }
+    </style>
+</head>
+<body>
+
+<!-- ===== CÍMLAP ===== -->
+<div class="cover">
+    <div class="icon">🕵️</div>
+    <h1>Revizor Asszisztens 1.0</h1>
+    <div class="subtitle">Bankegyeztető Rendszer</div>
+    <div class="meta">
+        Hetednapi Adventista Egyház<br>
+        Pénzügyi revíziós támogató alkalmazás<br><br>
+        <em>Verzió: 1.0 &mdash; 2025</em>
+    </div>
+</div>
+
+<!-- ===== TARTALOMJEGYZÉK ===== -->
+<div class="page-break"></div>
+<h2 style="border:none;">Tartalomjegyzék</h2>
+<ol class="section-toc">
+    <li><a href="#bevezetes">Vezetői összefoglaló</a></li>
+    <li><a href="#miert">Miért van szükség a Revizor Asszisztensre?</a></li>
+    <li><a href="#mire-kepes">Mire képes a Revizor Asszisztens?</a></li>
+    <li><a href="#eredmenyek">Várható eredmények</a></li>
+    <li><a href="#ots-igeny">Mit kérünk az OTS rendszertől?</a></li>
+    <li><a href="#biztonsag">Biztonsági garanciák</a></li>
+    <li><a href="#technikai">Technikai áttekintés</a></li>
+    <li><a href="#osszefoglalas">Összefoglalás</a></li>
+</ol>
+
+
+<!-- ===== 1. VEZETŐI ÖSSZEFOGLALÓ ===== -->
+<div class="page-break"></div>
+<h1 id="bevezetes">1. Vezetői összefoglaló</h1>
+
+<p>A <strong>Revizor Asszisztens 1.0</strong> egy webalapú bankegyeztető alkalmazás, amely a Hetednapi Adventista Egyház OTS pénzügyi rendszeréhez kapcsolódva automatizálja a gyülekezeti bankszámlák egyeztetését.</p>
+
+<p>Az egyházterületen <strong>több mint 70 gyülekezet</strong> működik, mindegyik saját bankszámlával. Jelenleg a revizorok <strong>teljes egészében kézi munkával</strong> egyeztetik a banki kivonatokat az OTS tranzakciókkal &mdash; egy gyülekezet havi egyeztetése akár <strong>2&ndash;4 órát</strong> is igénybe vehet.</p>
+
+<p>A Revizor Asszisztens ezt a folyamatot automatizálja, csökkentve a revíziós munkaidőt akár <strong>90%-kal</strong>, miközben növeli a pontosságot és a nyomon követhetőséget.</p>
+
+<div class="highlight-box">
+    <strong>Javaslat:</strong> Kérjük az OTS rendszerhez való <strong>olvasási hozzáférés</strong> engedélyezését és a revizorok OTS-bejelentkezésének jóváhagyását, hogy a Revizor Asszisztens 1.0 használatba vehető legyen.
+</div>
+
+
+<!-- ===== 2. MIÉRT VAN SZÜKSÉG RÁ? ===== -->
+<div class="page-break"></div>
+<h1 id="miert">2. Miért van szükség a Revizor Asszisztensre?</h1>
+
+<h3>Jelenlegi helyzet</h3>
+<ul>
+    <li>A revizor <strong>letölti</strong> a bankszámlakivonatot Excelben</li>
+    <li><strong>Sorról sorra</strong> megnyitja az OTS-ben az adott gyülekezet tranzakcióit</li>
+    <li><strong>Kézzel keresi</strong> ki a banki tételhez tartozó OTS rekordot</li>
+    <li>Egy gyülekezet havi egyeztetése akár <strong>2&ndash;4 óra</strong> lehet</li>
+    <li>A teljes revíziós kör &mdash; 70 gyülekezet × 12 hó &mdash; <strong>több száz munkaóra</strong></li>
+</ul>
+
+<h3>Problémák</h3>
+<table>
+    <tr><th style="width:35%">Probléma</th><th>Hatása</th></tr>
+    <tr><td>Lassú, kézi folyamat</td><td>A revizorok idejének nagy részét az egyeztetés viszi el</td></tr>
+    <tr><td>Hibalehetőség</td><td>Egy-egy tételt könnyű átnézni, kihagyni</td></tr>
+    <tr><td>Nincs nyomon követés</td><td>Nem lehet ellenőrizni, hogy mi lett egyeztetve és mi nem</td></tr>
+    <tr><td>Fárasztó, monoton munka</td><td>Növeli a hibák esélyét, csökkenti a hatékonyságot</td></tr>
+</table>
+
+
+<!-- ===== 3. MIT TUD? ===== -->
+<div class="page-break"></div>
+<h1 id="mire-kepes">3. Mire képes a Revizor Asszisztens?</h1>
+
+<h3>Automatikus párosítás</h3>
+<p>A rendszer az OTS adatbázisban <strong>automatikusan megkeresi</strong> a banki tételhez tartozó tranzakciót:</p>
+<ul>
+    <li><strong>Összeg + dátum</strong> alapján pontos egyezés</li>
+    <li>Több napos eltérés esetén is keres</li>
+    <li><strong>Közleményszöveg</strong> alapján is párosít (tized, adomány, átutalás, stb.)</li>
+    <li><strong>Egy OTS tételt csak egyszer használ fel</strong> &mdash; nincs duplikáció</li>
+</ul>
+
+<h3>Tömeges feltöltés</h3>
+<p>Az összes gyülekezet bankszámlakivonata <strong>egyetlen fájlban</strong> feltölthető. A rendszer magától felismeri, melyik tétel melyik gyülekezethez tartozik.</p>
+
+<h3>Kézi finomhangolás</h3>
+<p>Ahol az automatikus párosítás nem egyértelmű (pl. összevont banki költségek), a revizor <strong>manuálisan párosíthat</strong> &mdash; egy vagy akár több OTS tételt is hozzárendelhet egy banki sorhoz.</p>
+
+<h3>Teljes áttekintés</h3>
+<p>Minden párosítás látható, nyomon követhető:</p>
+<ul>
+    <li>Melyik banki tétel <strong>párosított</strong></li>
+    <li>Melyik <strong>még várakozik</strong></li>
+    <li>Melyikhez <strong>több OTS tétel</strong> tartozik &mdash; részletes kimutatás</li>
+</ul>
+
+<h3>OTS tranzakció-lekérdező</h3>
+<p>Az OTS tranzakciók <strong>gyors lekérdezése és exportálása</strong> egyetlen felületről:</p>
+<ul>
+    <li><strong>Banki tranzakciók</strong> szűrése &mdash; csak a bankon keresztül ment tranzakciók</li>
+    <li><strong>OTS tranzakciók</strong> szűrése &mdash; csak a készpénzes tranzakciók</li>
+    <li><strong>Teljes körű keresés</strong> &mdash; banki és készpénzes tranzakciók együtt</li>
+    <li><strong>Excel export</strong> &mdash; a lekérdezett adatok azonnal exportálhatók Excelbe</li>
+    <li><strong>Dátumtartomány és gyülekezet</strong> szerinti szűrés</li>
+</ul>
+
+<h3>Tranzakció Kereső (szerver oldali)</h3>
+<p>A banki és OTS adatbázisokban való <strong>célzott keresés</strong> anélkül, hogy előre le kellene tölteni az összes adatot:</p>
+<ul>
+    <li><strong>Bank, OTS vagy mindkettő</strong> adatbázisban keres egyszerre</li>
+    <li><strong>Összeg, dátum, szöveg, bizonylatszám</strong> szerinti szűrés</li>
+    <li><strong>Szerver oldali lekérdezés</strong> &mdash; nem tölti le az összes rekordot, csak a találatokat</li>
+    <li><strong>Oldalszámozott</strong> eredmények (50 tétel/oldal)</li>
+    <li><strong>Excel export</strong> a találatokból</li>
+    <li><strong>Státusz szűrés</strong> &mdash; párosított/párosítatlan banki tételek</li>
+</ul>
+
+<div class="highlight-box">
+    <strong>Fő funkciók:</strong> Banki CSV feltöltés · Automatikus párosítás · Kézi finomhangolás · Párosítatlan tételek keresése · Teljes körű nyomon követés · OTS tranzakció lekérdező · Tranzakció Kereső
+</div>
+
+
+<!-- ===== 4. VÁRHATÓ EREDMÉNYEK ===== -->
+<div class="page-break"></div>
+<h1 id="eredmenyek">4. Várható eredmények</h1>
+
+<table>
+    <tr><th style="width:40%">Mutató</th><th style="width:30%">Jelenleg</th><th style="width:30%">Revizor Asszisztenssel</th></tr>
+    <tr>
+        <td>Egy gyülekezet havi egyeztetése</td>
+        <td>2&ndash;4 óra <strong>kézi munka</strong></td>
+        <td>10&ndash;15 perc <strong>ellenőrzés</strong></td>
+    </tr>
+    <tr>
+        <td>A teljes havi revízió (70 gyülekezet)</td>
+        <td>150&ndash;300 munkaóra</td>
+        <td>10&ndash;20 munkaóra</td>
+    </tr>
+    <tr>
+        <td>Hibák</td>
+        <td>Előfordulhatnak</td>
+        <td>Minimálisra csökkennek</td>
+    </tr>
+    <tr>
+        <td>Nyomon követés</td>
+        <td>Nincs</td>
+        <td>Teljes körű</td>
+    </tr>
+</table>
+
+<div class="success-box">
+    <strong>A Revizor Asszisztens 1.0-val a revíziós munkaidő akár 90%-a megtakarítható.</strong>
+</div>
+
+
+<!-- ===== 5. MIT KÉRÜNK AZ OTS-TŐL? ===== -->
+<div class="page-break"></div>
+<h1 id="ots-igeny">5. Mit kérünk az OTS rendszertől?</h1>
+
+<p>A Revizor Asszisztens <strong>nem módosít</strong> semmit az OTS-ben &mdash; csak <strong>olvassa</strong> az adatokat.</p>
+
+<h3>5.1. OTS lekérdezési jogosultság</h3>
+<ul>
+    <li>Az OTS adatbázis tranzakciós tábláinak olvasása a gyülekezetekre</li>
+    <li><strong>Csak olvasási hozzáférés</strong> &mdash; az adatok nem változnak</li>
+    <li>A Revizor Asszisztens <strong>csak a revizor saját OTS felhasználójával</strong> fér hozzá az adatokhoz</li>
+</ul>
+
+<h3>5.2. OTS bejelentkezés engedélyezése</h3>
+<ul>
+    <li>A revizoroknak rendelkezniük kell <strong>érvényes OTS fiókkal</strong></li>
+    <li>A belépés az OTS szokásos felületén keresztül történik</li>
+    <li>A Revizor Asszisztens ugyanazt a session időkorlátot használja, mint az OTS</li>
+</ul>
+
+<h3 id="biztonsag">5.3. Biztonsági garanciák</h3>
+<table>
+    <tr><th style="width:35%">Szempont</th><th>Garancia</th></tr>
+    <tr><td>Adatmódosítás</td><td>A Revizor Asszisztens soha nem módosít OTS adatokat &mdash; csak olvas</td></tr>
+    <tr><td>Jelszavak</td><td>Nem tárol jelszavakat; az OTS session kezel</td></tr>
+    <tr><td>Session védelem</td><td>20 perc inaktivitás után automatikus kiléptetés</td></tr>
+    <tr><td>CSRF védelem</td><td>Minden művelet előtt token ellenőrzés</td></tr>
+    <tr><td>Naplózás</td><td>Minden párosítás naplózva van</td></tr>
+    <tr><td>Szerver</td><td>Az egyházterületi szerveren fut, nem külső szolgáltatónál</td></tr>
+</table>
+
+
+<!-- ===== 6. TECHNIKAI ÁTTEKINTÉS ===== -->
+<div class="page-break"></div>
+<h1 id="technikai">6. Technikai áttekintés</h1>
+
+<h3>Architektúra</h3>
+<p>A Revizor Asszisztens az OTS rendszerrel <strong>azonos MySQL szerveren</strong> fut, kizárólag olvasási jogosultsággal. Saját adatbázisban tárolja a párosítási adatokat, teljesen elkülönülve az OTS adataitól.</p>
+
+<div class="highlight-box">
+    <strong>Két külön adatbázis:</strong> Az OTS adatai érintetlenek maradnak. A Revizor Asszisztens kizárólag a saját <code>revizor_db</code> adatbázisába ír.
+</div>
+
+<h3>Elért OTS táblák (csak olvasás)</h3>
+<table>
+    <tr><th>OTS tábla</th><th>Használt oszlopok</th><th>Cél</th></tr>
+    <tr>
+        <td><code>TRANSACTIONS</code></td>
+        <td><code>RECORD_ID, CHURCH_ID, AMOUNT, TYPE, DATETIME, CASH_DOCUMENT_NUMBER, DECISION_NUMBER, PERSON_ID, NAME_ID, NAME2_ID, FUND_ID, EDITED_BY, VIA_BANK</code></td>
+        <td>Tranzakciók olvasása párosításhoz és megjelenítéshez</td>
+    </tr>
+    <tr>
+        <td><code>churches</code></td>
+        <td><code>id, name</code></td>
+        <td>Gyülekezet nevének megjelenítése</td>
+    </tr>
+    <tr>
+        <td><code>PERSONS</code></td>
+        <td><code>id, NAME_PREFIX, NAME, NAME_SUFFIX</code></td>
+        <td>Partner nevének előállítása</td>
+    </tr>
+    <tr>
+        <td><code>NAMES_OF_TRANSACTION</code></td>
+        <td><code>id, NAME</code></td>
+        <td>Tranzakció szöveges leírása</td>
+    </tr>
+    <tr>
+        <td><code>funds</code></td>
+        <td><code>id, NAME</code></td>
+        <td>Alap megnevezése (Tized, Adomány, stb.)</td>
+    </tr>
+    <tr>
+        <td><code>TRANSACTION_TYPE</code></td>
+        <td><code>id, NAME</code></td>
+        <td>Tranzakció típusának megjelenítése</td>
+    </tr>
+    <tr>
+        <td><code>USERS</code></td>
+        <td><code>id, NAME</code></td>
+        <td>Rögzítő nevének megjelenítése</td>
+    </tr>
+    <tr>
+        <td><code>transfers_to_conference</code></td>
+        <td><code>CHURCH_ID, AMOUNT, YEAR, MONTH, DAY, VIA_BANK</code></td>
+        <td>Konferencia-utalások párosítása</td>
+    </tr>
+</table>
+
+<h3>Adatkapcsolatok</h3>
+<p>A Revizor Asszisztens az alábbi azonosítók alapján kapcsolja össze a banki adatokat az OTS tranzakciókkal:</p>
+<ul>
+    <li><code>church_id</code> &mdash; a gyülekezet azonosítója</li>
+    <li><code>RECORD_ID</code> &mdash; az OTS tranzakció egyedi azonosítója</li>
+    <li>Bankszámlaszám &mdash; a gyülekezet azonosításához a CSV feltöltés során</li>
+</ul>
+<p>Az azonosítók <strong>csak referenciaként</strong> szerepelnek a Revizor adatbázisában &mdash; nincs idegen kulcs kapcsolat, így az OTS adatainak változása nem okoz hibát.</p>
+
+
+<!-- ===== 7. ÖSSZEFOGLALÁS ===== -->
+<div class="page-break"></div>
+<h1 id="osszefoglalas">7. Összefoglalás</h1>
+
+<p>A Revizor Asszisztens 1.0 egy <strong>egyszerű, biztonságos, webalapú eszköz</strong>, amely:</p>
+
+<table>
+    <tr><td style="width:40px; text-align:center; font-size:18pt; color:#2e7d32;">✅</td><td><strong>Automatizálja</strong> a banki egyeztetés 90%-át</td></tr>
+    <tr><td style="text-align:center; font-size:18pt; color:#2e7d32;">✅</td><td><strong>Kiküszöböli</strong> a kézi hibákat</td></tr>
+    <tr><td style="text-align:center; font-size:18pt; color:#2e7d32;">✅</td><td><strong>Naprakész áttekintést</strong> ad a revízió állapotáról</td></tr>
+    <tr><td style="text-align:center; font-size:18pt; color:#2e7d32;">✅</td><td><strong>Nem módosítja</strong> az OTS adatokat</td></tr>
+    <tr><td style="text-align:center; font-size:18pt; color:#2e7d32;">✅</td><td><strong>Nem tárol</strong> jelszavakat</td></tr>
+    <tr><td style="text-align:center; font-size:18pt; color:#2e7d32;">✅</td><td><strong>Nem igényel</strong> telepítést &mdash; böngészőből használható</td></tr>
+</table>
+
+<div class="success-box">
+    <strong>A bevezetésével a revíziós munka hatékonyabbá, gyorsabbá és pontosabbá válik, ami az egész egyházterület pénzügyi átláthatóságát erősíti.</strong>
+</div>
+
+<p style="text-align:center; margin-top:40px; color:#7a7a7a; font-size:9pt;">
+    Revizor Asszisztens 1.0 &mdash; Bankegyeztető Rendszer<br>
+    Hetednapi Adventista Egyház
+</p>
+
+</body>
+</html>

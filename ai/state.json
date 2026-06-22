@@ -1,0 +1,44 @@
+{
+  "project": "Revizor Asszisztens 1.0",
+  "status": "active",
+  "last_session": "2026-06-22",
+  "version": "1.0",
+  "git_branch": "main",
+  "features": {
+    "csv_upload": {
+      "status": "done",
+      "details": "Multi/single church CSV upload with hash dedup"
+    },
+    "progressive_matching": {
+      "status": "done",
+      "details": "7 passes (0,3,6,12,35,60 days + text), min score 10 for text pass"
+    },
+    "duplicate_filter": {
+      "status": "done",
+      "details": "40-day window, same amount + first 80 chars of bank_desc"
+    },
+    "custom_patterns": {
+      "status": "done",
+      "details": "Church-specific keyword pairs, +3 score in text pass, CRUD UI on reconciliation.php"
+    },
+    "document_check": {
+      "status": "done",
+      "details": "13-point audit checklist, sortable table, localStorage filters"
+    },
+    "transaction_search": {
+      "status": "done",
+      "details": "Server-side search with OTS→Bank reverse lookup"
+    },
+    "ots_query": {
+      "status": "done",
+      "details": "WebIX-based multi-church transaction query (all_transactions_multi.php)"
+    },
+    "session_management": {
+      "status": "done",
+      "details": "20-min Revizor session, AJAX keepalive, popup login with polling"
+    }
+  },
+  "pending_tasks": [],
+  "known_issues": [],
+  "next_planned": null
+}

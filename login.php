@@ -1,11 +1,27 @@
 <?php
-session_start();
+require_once __DIR__ . '/../ots/constant.php';
+
+// AJAX session check endpoint — must run before session_destroy
+if (isset($_GET['check'])) {
+    header('Content-Type: application/json');
+    if (session_status() != PHP_SESSION_ACTIVE) { session_start(); }
+    require_once __DIR__ . '/../ots/session_handler.php';
+    echo json_encode(['logged_in' => isset($_SESSION[GC_LOGIN_COOKIE])]);
+    exit;
+}
+
+if (session_status() != PHP_SESSION_ACTIVE) { session_start(); }
+$just_logged_in = isset($_GET['ots_ready']) && isset($_SESSION[GC_LOGIN_COOKIE]);
+if ($just_logged_in) {
+    header('Location: index.php');
+    exit;
+}
 session_destroy();
 ?><!DOCTYPE html>
 <html lang="hu">
 <head>
     <meta charset="UTF-8">
-    <title>Revizor - Bejelentkezés</title>
+    <title>Revizor Asszisztens 1.0 - Bejelentkezés</title>
     <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
     <style>
         body { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); min-height: 100vh; display: flex; align-items: center; justify-content: center; }
@@ -16,20 +32,57 @@ session_destroy();
 <body>
     <div class="login-card">
         <div class="logo">🕵️</div>
-        <h4 class="mb-1">Revizori Panel</h4>
+        <h4 class="mb-1">Revizor Asszisztens 1.0</h4>
         <p class="text-muted small mb-4">Bankegyeztető rendszer</p>
         <hr>
-        <p class="mb-3">A munkameneted lejárt. Jelentkezz be az OTS rendszerbe, majd gyere vissza!</p>
+        <p class="mb-3">A munkameneted lejárt. Jelentkezz be az OTS rendszerbe!</p>
         <ol class="text-start small text-muted mb-4">
             <li>Kattints a <strong>Belépés az OTS-be</strong> gombra</li>
-            <li>Jelentkezz be az OTS felületén (új lapon nyílik meg)</li>
-            <li>Térj vissza ide és kattints a <strong>Beléptem, folytatom</strong> gombra</li>
+            <li>Jelentkezz be az OTS felületén (felugró ablakban nyílik meg)</li>
+            <li>Ha sikeres a belépés, automatikusan átirányítunk a revizorba</li>
         </ol>
+        <p class="text-danger small mb-3" id="popupBlockedMsg" style="display:none;">⚠️ A felugró ablakot blokkolta a böngésző. Engedélyezd a felugró ablakokat erre az oldalra, vagy használd a lenti linket.</p>
         <div class="d-grid gap-2">
-            <button class="btn btn-primary btn-lg" onclick="window.open('../ots/index.php','_blank')">🔑 Belépés az OTS-be</button>
-            <a href="index.php" class="btn btn-success">✅ Beléptem, folytatom</a>
+            <button class="btn btn-primary btn-lg" onclick="openOtsLogin()">🔑 Belépés az OTS-be</button>
+            <a href="index.php" class="btn btn-outline-success btn-sm" id="fallbackContinueBtn" style="display:none;">✅ Már beléptem, folytatom</a>
         </div>
-        <p class="mt-3 text-muted small">Ha nincs OTS fiókod, kérj segítséget a rendszergazdától.</p>
+        <div id="loginStatus" class="mt-3 text-muted small"></div>
     </div>
+    <script>
+    var otsPopup = null;
+
+    function openOtsLogin() {
+        otsPopup = window.open('../ots/index.php', 'otsLogin', 'width=1200,height=800,menubar=no,toolbar=yes,scrollbars=yes');
+        if (!otsPopup || otsPopup.closed || typeof otsPopup.closed === 'undefined') {
+            document.getElementById('popupBlockedMsg').style.display = 'block';
+            document.getElementById('fallbackContinueBtn').style.display = 'block';
+            return;
+        }
+        document.getElementById('loginStatus').innerHTML = '<span class="spinner-border spinner-border-sm me-1"></span>OTS belépés figyelése...';
+        pollSession();
+    }
+
+    function pollSession() {
+        fetch('login.php?check=1')
+        .then(function(r) { return r.json(); })
+        .then(function(result) {
+            if (result.logged_in) {
+                document.getElementById('loginStatus').innerHTML = '✅ Sikeres belépés! Átirányítás...';
+                if (otsPopup && !otsPopup.closed) { try { otsPopup.close(); } catch(e) {} }
+                window.location.href = 'index.php';
+            } else {
+                setTimeout(pollSession, 1500);
+            }
+        })
+        .catch(function() {
+            setTimeout(pollSession, 2000);
+        });
+    }
+
+    // Fallback: mutassuk a "Beléptem" gombot 30 mp után is
+    setTimeout(function() {
+        document.getElementById('fallbackContinueBtn').style.display = 'block';
+    }, 30000);
+    </script>
 </body>
 </html>
