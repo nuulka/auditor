@@ -16,6 +16,11 @@ if (!isset($_SESSION[GC_LOGIN_COOKIE])) {
     exit;
 }
 
+// load common auth helpers and build user context
+require_once __DIR__ . '/lib/bootstrap.php';
+require_once __DIR__ . '/lib/auth.php';
+build_user_context_from_ots();
+
 define('REVIZOR_SESSION_DURATION', 1200);
 if (!isset($_SESSION['revizor_expires_at'])) {
     $_SESSION['revizor_expires_at'] = time() + REVIZOR_SESSION_DURATION;
@@ -71,6 +76,10 @@ if ($ch_res) {
 // Search params
 $source = isset($_GET['source']) ? $_GET['source'] : 'bank';
 $church_id = isset($_GET['church_id']) ? intval($_GET['church_id']) : 0;
+// if a church is requested, ensure the user has access
+if ($church_id > 0) {
+    require_church_access($church_id);
+}
 $amount_min = isset($_GET['amount_min']) && $_GET['amount_min'] !== '' ? floatval($_GET['amount_min']) : null;
 $amount_max = isset($_GET['amount_max']) && $_GET['amount_max'] !== '' ? floatval($_GET['amount_max']) : null;
 $date_from = isset($_GET['date_from']) ? trim($_GET['date_from']) : '';
