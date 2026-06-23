@@ -1057,6 +1057,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['
         exit;
     }
 
+    // scope check
+    require_church_access($church_id);
+
     // Kulcsszavak kinyerése a banki közleményből
     $search_text = $bank_desc . ' ' . $bank_ext_name;
     $words = preg_split('/[\s,\.\-\/\(\)\[\]":;!?\+]+/u', $search_text, -1, PREG_SPLIT_NO_EMPTY);
