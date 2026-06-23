@@ -64,12 +64,19 @@ if (empty($exp_types)) { $exp_types = [-1]; }
 $exp_types_str = implode(',', array_map('intval', array_filter($exp_types, 'is_numeric')));
 if (empty($exp_types_str)) { $exp_types_str = '-1'; }
 
-// Church list
+// Church list - restrict to accessible churches for non-admin
 $churches = [];
-$ch_res = $conn->query("SELECT id, name FROM ots.churches WHERE name IS NOT NULL AND name != '' ORDER BY name ASC");
-if ($ch_res) {
-    while ($ch = $ch_res->fetch_assoc()) {
-        $churches[] = $ch;
+if (is_admin()) {
+    $ch_res = $conn->query("SELECT id, name FROM ots.churches WHERE name IS NOT NULL AND name != '' ORDER BY name ASC");
+    if ($ch_res) {
+        while ($ch = $ch_res->fetch_assoc()) { $churches[] = $ch; }
+    }
+} else {
+    $allowed = get_accessible_church_ids();
+    if (!empty($allowed)) {
+        $ids = implode(',', array_map('intval', $allowed));
+        $ch_res = $conn->query("SELECT id, name FROM ots.churches WHERE id IN ($ids) ORDER BY name ASC");
+        if ($ch_res) { while ($ch = $ch_res->fetch_assoc()) { $churches[] = $ch; } }
     }
 }
 
