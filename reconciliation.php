@@ -301,8 +301,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['
     if ($id > 0) {
         if ($status === 'UNCHECKED' && empty($ots_doc_input)) {
             // Ha visszaállítják Feldolgozatlanra és nincs bizonylatszám, töröljük az OTS adatokat (Tiszta lap)
-            $sql = "UPDATE bank_reconciliation SET status='$status', comment='$comment', updated_by='$user', ots_date=NULL, ots_doc='', ots_amount=NULL WHERE id=$id";
-            $conn->query($sql);
+            $upd = $conn->prepare("UPDATE bank_reconciliation SET status=?, comment=?, updated_by=?, ots_date=NULL, ots_doc='', ots_amount=NULL WHERE id=?");
+            if ($upd) { $upd->bind_param('sssi', $status, $comment, $user, $id); $upd->execute(); }
         } else {
             if (!empty($ots_doc_input)) {
                 // Kézi bizonylatszám párosítás
@@ -321,20 +321,21 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['
                                   GROUP BY RECORD_ID LIMIT 1";
                     $ots_res = $conn->query($ots_query);
                     
-                    if ($ots_res && $ots_res->num_rows > 0) {
-                        $ots_data = $ots_res->fetch_assoc();
-                        $o_date = $ots_data['ots_date'];
-                        $o_amt = $ots_data['ots_amount'];
-                        if ($status === 'UNCHECKED') { $status = 'OK'; }
-                        $sql = "UPDATE bank_reconciliation SET status='$status', comment='$comment', updated_by='$user', ots_date='$o_date', ots_doc='$ots_doc_input', ots_amount=$o_amt WHERE id=$id";
-                    } else {
-                        $sql = "UPDATE bank_reconciliation SET status='$status', comment='$comment', updated_by='$user', ots_doc='$ots_doc_input' WHERE id=$id";
-                    }
-                    $conn->query($sql);
+                        if ($ots_res && $ots_res->num_rows > 0) {
+                            $ots_data = $ots_res->fetch_assoc();
+                            $o_date = $ots_data['ots_date'];
+                            $o_amt = $ots_data['ots_amount'];
+                            if ($status === 'UNCHECKED') { $status = 'OK'; }
+                            $upd = $conn->prepare("UPDATE bank_reconciliation SET status=?, comment=?, updated_by=?, ots_date=?, ots_doc=?, ots_amount=? WHERE id=?");
+                            if ($upd) { $upd->bind_param('ssssdii', $status, $comment, $user, $o_date, $ots_doc_input, $o_amt, $id); $upd->execute(); }
+                        } else {
+                            $upd = $conn->prepare("UPDATE bank_reconciliation SET status=?, comment=?, updated_by=?, ots_doc=? WHERE id=?");
+                            if ($upd) { $upd->bind_param('ssssi', $status, $comment, $user, $ots_doc_input, $id); $upd->execute(); }
+                        }
                 }
             } else {
-                $sql = "UPDATE bank_reconciliation SET status='$status', comment='$comment', updated_by='$user' WHERE id=$id";
-                $conn->query($sql);
+                $upd = $conn->prepare("UPDATE bank_reconciliation SET status=?, comment=?, updated_by=? WHERE id=?");
+                if ($upd) { $upd->bind_param('sssi', $status, $comment, $user, $id); $upd->execute(); }
             }
         }
         echo "OK";
