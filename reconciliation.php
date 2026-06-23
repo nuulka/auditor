@@ -925,6 +925,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['
         exit;
     }
 
+    // require access to this church
+    require_church_access($church_id);
+
     $adjusted_amount_sql = "IF(T.TYPE IN ($exp_types_str), -1 * T.AMOUNT, T.AMOUNT)";
 
     $base_joins = "FROM ots.TRANSACTIONS T

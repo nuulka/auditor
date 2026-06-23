@@ -23,7 +23,6 @@ if (!isset($_SESSION[GC_LOGIN_COOKIE])) {
 require_once __DIR__ . '/lib/bootstrap.php';
 require_once __DIR__ . '/lib/auth.php';
 if (!is_admin()) {
-    // simple redirect for non-admins
     header('Location: index.php');
     exit;
 }
@@ -470,6 +469,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 // AJAX multi-upload handler (insert only, no auto-match)
 //
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['action'] === 'multi_upload_ajax') {
+    // only admin allowed for multi-upload
+    if (!is_admin()) { echo json_encode(['status'=>'ERROR','message'=>'Only admin allowed']); exit; }
     header('Content-Type: application/json');
     if (!isset($_POST['csrf_token']) || $_POST['csrf_token'] !== $_SESSION['csrf_token']) {
         echo json_encode(['status' => 'ERROR', 'message' => 'CSRF mismatch']);
@@ -570,6 +571,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['
 // AJAX progressive match pass handler
 //
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['action'] === 'progressive_match_pass') {
+    // only admin allowed
+    if (!is_admin()) { echo json_encode(['status'=>'ERROR','message'=>'Only admin allowed']); exit; }
     header('Content-Type: application/json');
     try {
         if (!isset($_POST['csrf_token']) || $_POST['csrf_token'] !== $_SESSION['csrf_token']) {
