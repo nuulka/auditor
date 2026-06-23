@@ -79,10 +79,15 @@ $resolveFriendlyName = function($acc, $defaultName) use ($church_account_map, $c
         $cid = $church_account_map[$cleanAcc];
         if ($cid === 0) {
             // Egyházterületi számla: név a church_bank_accounts táblából
-            $r = $conn->query("SELECT bank_name FROM church_bank_accounts WHERE bank_account_clean = '$cleanAcc' LIMIT 1");
-            if ($r && $r = $r->fetch_assoc()) {
-                return $r['bank_name'] ?: $defaultName;
-            }
+                                $stmt_acc = $conn->prepare("SELECT bank_name FROM church_bank_accounts WHERE bank_account_clean = ? LIMIT 1");
+                                if ($stmt_acc) {
+                                    $stmt_acc->bind_param('s', $bank_acc_clean);
+                                    $stmt_acc->execute();
+                                    $res_acc = $stmt_acc->get_result();
+                                    if ($res_acc && ($row_acc = $res_acc->fetch_assoc())) {
+                                        return $row_acc['bank_name'] ?: $defaultName;
+                                    }
+                                }
         }
         return $church_names[$cid] ?? $defaultName;
     }
@@ -594,8 +599,15 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['
         $church_res = $conn->query("SELECT DISTINCT church_id FROM bank_reconciliation WHERE status = 'UNCHECKED'");
         while ($c = $church_res->fetch_assoc()) {
             $cid = $c['church_id'];
-            $rec_res = $conn->query("SELECT id, bank_date, bank_amount FROM bank_reconciliation WHERE church_id = $cid AND status = 'UNCHECKED'");
-            while ($rec = $rec_res->fetch_assoc()) {
+                $stmt_recs = $conn->prepare("SELECT id, bank_date, bank_amount FROM bank_reconciliation WHERE church_id = ? AND status = 'UNCHECKED'");
+                if ($stmt_recs) {
+                    $stmt_recs->bind_param('i', $cid);
+                    $stmt_recs->execute();
+                    $rec_res = $stmt_recs->get_result();
+                } else {
+                    $rec_res = $conn->query("SELECT id, bank_date, bank_amount FROM bank_reconciliation WHERE church_id = $cid AND status = 'UNCHECKED'");
+                }
+                while ($rec = $rec_res->fetch_assoc()) {
                 $used_sub = "(SELECT ots_record_id FROM bank_reconciliation WHERE ots_record_id IS NOT NULL UNION SELECT record_id FROM bank_reconciliation_items)";
                 $ots_query = "SELECT MAX(CASH_DOCUMENT_NUMBER) AS ots_doc, MAX(DATETIME) AS ots_date, RECORD_ID FROM ots.TRANSACTIONS WHERE CHURCH_ID = ? AND DATETIME BETWEEN DATE_SUB(?, INTERVAL ? DAY) AND DATE_ADD(?, INTERVAL ? DAY) AND VIA_BANK <> 0 AND RECORD_ID NOT IN $used_sub GROUP BY RECORD_ID HAVING SUM(IF(TYPE IN ($exp_types_str), -1 * AMOUNT, AMOUNT)) = ?";
                 $stmt = $conn->prepare($ots_query);
@@ -648,7 +660,14 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['
         $church_res = $conn->query("SELECT DISTINCT church_id FROM bank_reconciliation WHERE status = 'UNCHECKED'");
         while ($c = $church_res->fetch_assoc()) {
             $cid = $c['church_id'];
-            $rec_res = $conn->query("SELECT id, bank_date, bank_amount, bank_desc FROM bank_reconciliation WHERE church_id = $cid AND status = 'UNCHECKED'");
+                $stmt_recs2 = $conn->prepare("SELECT id, bank_date, bank_amount, bank_desc FROM bank_reconciliation WHERE church_id = ? AND status = 'UNCHECKED'");
+                if ($stmt_recs2) {
+                    $stmt_recs2->bind_param('i', $cid);
+                    $stmt_recs2->execute();
+                    $rec_res = $stmt_recs2->get_result();
+                } else {
+                    $rec_res = $conn->query("SELECT id, bank_date, bank_amount, bank_desc FROM bank_reconciliation WHERE church_id = $cid AND status = 'UNCHECKED'");
+                }
             while ($rec = $rec_res->fetch_assoc()) {
                 $bd = mb_strtolower(trim($rec['bank_desc'] ?? ''), 'UTF-8');
                 if (empty($bd)) continue;

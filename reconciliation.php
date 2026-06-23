@@ -89,7 +89,14 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['
         }
         // admin or revizor of that church can list patterns
         require_church_access($church_id);
-        $res = $conn->query("SELECT id, church_id, bank_pattern, ots_pattern, label FROM custom_patterns WHERE church_id = $church_id ORDER BY id");
+        $stmt_cp = $conn->prepare("SELECT id, church_id, bank_pattern, ots_pattern, label FROM custom_patterns WHERE church_id = ? ORDER BY id");
+        if ($stmt_cp) {
+            $stmt_cp->bind_param('i', $church_id);
+            $stmt_cp->execute();
+            $res = $stmt_cp->get_result();
+        } else {
+            $res = $conn->query("SELECT id, church_id, bank_pattern, ots_pattern, label FROM custom_patterns WHERE church_id = $church_id ORDER BY id");
+        }
         $items = [];
         while ($r = $res->fetch_assoc()) {
             $items[] = $r;
@@ -306,32 +313,37 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['
         } else {
             if (!empty($ots_doc_input)) {
                 // Kézi bizonylatszám párosítás
-                    $row_q = $conn->query("SELECT church_id FROM bank_reconciliation WHERE id=$id");
-                    if ($row_q && $row_q->num_rows > 0) {
-                        $r = $row_q->fetch_assoc();
+                $stmt_ch = $conn->prepare("SELECT church_id FROM bank_reconciliation WHERE id = ?");
+                if ($stmt_ch) {
+                    $stmt_ch->bind_param('i', $id);
+                    $stmt_ch->execute();
+                    $rr = $stmt_ch->get_result();
+                    if ($rr && ($r = $rr->fetch_assoc())) {
                         $c_id = $r['church_id'];
+                        require_church_access(intval($c_id));
+                    }
+                }
 
-                    // ensure user has access to this church
-                    require_church_access(intval($c_id));
+                // Megkeressük az OTS-ben a bizonylatot (akár bank, akár pénztár)
+                $stmt_ots = $conn->prepare("SELECT DATE(MAX(DATETIME)) as ots_date, SUM(IF(T.TYPE IN ($exp_types_str), -1 * T.AMOUNT, T.AMOUNT)) as ots_amount FROM ots.TRANSACTIONS T WHERE CHURCH_ID = ? AND CASH_DOCUMENT_NUMBER = ? GROUP BY RECORD_ID LIMIT 1");
+                if ($stmt_ots) {
+                    $stmt_ots->bind_param('is', $c_id, $ots_doc_input);
+                    $stmt_ots->execute();
+                    $ots_res = $stmt_ots->get_result();
+                } else {
+                    $ots_res = $conn->query("SELECT DATE(MAX(DATETIME)) as ots_date, SUM(IF(T.TYPE IN ($exp_types_str), -1 * T.AMOUNT, T.AMOUNT)) as ots_amount FROM ots.TRANSACTIONS T WHERE CHURCH_ID = $c_id AND CASH_DOCUMENT_NUMBER = '$ots_doc_input' GROUP BY RECORD_ID LIMIT 1");
+                }
 
-                    // Megkeressük az OTS-ben a bizonylatot (akár bank, akár pénztár)
-                    $ots_query = "SELECT DATE(MAX(DATETIME)) as ots_date, SUM(IF(T.TYPE IN ($exp_types_str), -1 * T.AMOUNT, T.AMOUNT)) as ots_amount 
-                                  FROM ots.TRANSACTIONS T
-                                  WHERE CHURCH_ID = $c_id AND CASH_DOCUMENT_NUMBER = '$ots_doc_input'
-                                  GROUP BY RECORD_ID LIMIT 1";
-                    $ots_res = $conn->query($ots_query);
-                    
-                        if ($ots_res && $ots_res->num_rows > 0) {
-                            $ots_data = $ots_res->fetch_assoc();
-                            $o_date = $ots_data['ots_date'];
-                            $o_amt = $ots_data['ots_amount'];
-                            if ($status === 'UNCHECKED') { $status = 'OK'; }
-                            $upd = $conn->prepare("UPDATE bank_reconciliation SET status=?, comment=?, updated_by=?, ots_date=?, ots_doc=?, ots_amount=? WHERE id=?");
-                            if ($upd) { $upd->bind_param('ssssdii', $status, $comment, $user, $o_date, $ots_doc_input, $o_amt, $id); $upd->execute(); }
-                        } else {
-                            $upd = $conn->prepare("UPDATE bank_reconciliation SET status=?, comment=?, updated_by=?, ots_doc=? WHERE id=?");
-                            if ($upd) { $upd->bind_param('ssssi', $status, $comment, $user, $ots_doc_input, $id); $upd->execute(); }
-                        }
+                if ($ots_res && $ots_res->num_rows > 0) {
+                    $ots_data = $ots_res->fetch_assoc();
+                    $o_date = $ots_data['ots_date'];
+                    $o_amt = $ots_data['ots_amount'];
+                    if ($status === 'UNCHECKED') { $status = 'OK'; }
+                    $upd = $conn->prepare("UPDATE bank_reconciliation SET status=?, comment=?, updated_by=?, ots_date=?, ots_doc=?, ots_amount=? WHERE id=?");
+                    if ($upd) { $upd->bind_param('ssssdii', $status, $comment, $user, $o_date, $ots_doc_input, $o_amt, $id); $upd->execute(); }
+                } else {
+                    $upd = $conn->prepare("UPDATE bank_reconciliation SET status=?, comment=?, updated_by=?, ots_doc=? WHERE id=?");
+                    if ($upd) { $upd->bind_param('ssssi', $status, $comment, $user, $ots_doc_input, $id); $upd->execute(); }
                 }
             } else {
                 $upd = $conn->prepare("UPDATE bank_reconciliation SET status=?, comment=?, updated_by=? WHERE id=?");
@@ -1300,13 +1312,19 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['
     }
 
     // ensure user may modify this bank_reconciliation record
-    $row_q = $conn->query("SELECT church_id FROM bank_reconciliation WHERE id=$id");
-    if (!$row_q || $row_q->num_rows === 0) { echo json_encode(['status'=>'ERROR','message'=>'Record not found']); exit; }
-    $row = $row_q->fetch_assoc();
-    require_church_access(intval($row['church_id']));
+    $stmt_ch2 = $conn->prepare("SELECT church_id FROM bank_reconciliation WHERE id = ?");
+    if ($stmt_ch2) {
+        $stmt_ch2->bind_param('i', $id);
+        $stmt_ch2->execute();
+        $resch = $stmt_ch2->get_result();
+        if (!$resch || $resch->num_rows === 0) { echo json_encode(['status'=>'ERROR','message'=>'Record not found']); exit; }
+        $row = $resch->fetch_assoc();
+        require_church_access(intval($row['church_id']));
+    }
 
     // Töröljük a korábbi items rekordokat
-    $conn->query("DELETE FROM bank_reconciliation_items WHERE reconciliation_id = $id");
+    $del_it = $conn->prepare("DELETE FROM bank_reconciliation_items WHERE reconciliation_id = ?");
+    if ($del_it) { $del_it->bind_param('i', $id); $del_it->execute(); }
 
     if ($mode === 'multi' && isset($_POST['record_ids']) && is_array($_POST['record_ids'])) {
         // --- TÖBB OTS TÉTEL PÁROSÍTÁSA ---
@@ -1387,18 +1405,28 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['
         // RECORD_ID meghatározása
         $record_id = isset($_POST['ots_record_id']) ? intval($_POST['ots_record_id']) : 0;
         if ($record_id <= 0 && !empty($ots_doc)) {
-            $rid_res = $conn->query("SELECT RECORD_ID, AMOUNT, TYPE FROM ots.TRANSACTIONS WHERE CASH_DOCUMENT_NUMBER = '$ots_doc' AND CHURCH_ID = (SELECT church_id FROM bank_reconciliation WHERE id = $id) LIMIT 1");
-            if ($rid_res && $rid_res->num_rows > 0) {
-                $rid_row = $rid_res->fetch_assoc();
-                $record_id = $rid_row['RECORD_ID'];
+            $stmt_r = $conn->prepare("SELECT RECORD_ID, AMOUNT, TYPE FROM ots.TRANSACTIONS WHERE CASH_DOCUMENT_NUMBER = ? AND CHURCH_ID = (SELECT church_id FROM bank_reconciliation WHERE id = ?) LIMIT 1");
+            if ($stmt_r) {
+                $stmt_r->bind_param('si', $ots_doc, $id);
+                $stmt_r->execute();
+                $rid_res = $stmt_r->get_result();
+                if ($rid_res && $rid_res->num_rows > 0) {
+                    $rid_row = $rid_res->fetch_assoc();
+                    $record_id = $rid_row['RECORD_ID'];
+                }
             }
         }
         if ($record_id > 0) {
             $adj_single = 0;
-            $rid_amt = $conn->query("SELECT AMOUNT, TYPE FROM ots.TRANSACTIONS WHERE RECORD_ID = $record_id LIMIT 1");
-            if ($rid_amt && $rid_amt->num_rows > 0) {
-                $ra = $rid_amt->fetch_assoc();
-                $adj_single = in_array($ra['TYPE'], $exp_types) ? -1 * $ra['AMOUNT'] : $ra['AMOUNT'];
+            $stmt_ra = $conn->prepare("SELECT AMOUNT, TYPE FROM ots.TRANSACTIONS WHERE RECORD_ID = ? LIMIT 1");
+            if ($stmt_ra) {
+                $stmt_ra->bind_param('i', $record_id);
+                $stmt_ra->execute();
+                $rid_amt = $stmt_ra->get_result();
+                if ($rid_amt && $rid_amt->num_rows > 0) {
+                    $ra = $rid_amt->fetch_assoc();
+                    $adj_single = in_array($ra['TYPE'], $exp_types) ? -1 * $ra['AMOUNT'] : $ra['AMOUNT'];
+                }
             }
             $stmt_item = $conn->prepare("INSERT INTO bank_reconciliation_items (reconciliation_id, record_id, amount) VALUES (?, ?, ?)");
             if ($stmt_item) {

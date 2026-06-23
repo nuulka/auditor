@@ -30,8 +30,13 @@ require_church_access(intval($row['church_id'] ?? 0));
 
 // Audit adatok lekérése
 $audit = null;
-$audit_res = $conn->query("SELECT * FROM audit_checklist WHERE bank_reconciliation_id = $bank_id");
-if ($audit_res && $audit_res->num_rows > 0) { $audit = $audit_res->fetch_assoc(); }
+$stmt_ac = $conn->prepare("SELECT * FROM audit_checklist WHERE bank_reconciliation_id = ?");
+if ($stmt_ac) {
+    $stmt_ac->bind_param('i', $bank_id);
+    $stmt_ac->execute();
+    $audit_res = $stmt_ac->get_result();
+    if ($audit_res && $audit_res->num_rows > 0) { $audit = $audit_res->fetch_assoc(); }
+}
 
 $row['audit'] = $audit;
 header('Content-Type: application/json');
