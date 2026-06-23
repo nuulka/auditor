@@ -350,10 +350,19 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['
     }
     header('Content-Type: application/json');
     $amount = abs(floatval($_POST['amount']));
-    
+    // restrict to accessible churches for non-admin users
+    if (!is_admin()) {
+        $allowed = get_accessible_church_ids();
+        if (empty($allowed)) { echo json_encode(['status'=>'ERROR','message'=>'No accessible churches']); exit; }
+        $ids = implode(',', array_map('intval', $allowed));
+        $church_where = "AND T.CHURCH_ID IN ($ids)";
+    } else {
+        $church_where = '';
+    }
+
     $sql = "SELECT c.name as church_name, DATE(MAX(T.DATETIME)) as ots_date, T.CASH_DOCUMENT_NUMBER as ots_doc, 
-                   SUM(IF(T.TYPE IN ($exp_types_str), -1 * T.AMOUNT, T.AMOUNT)) as total_amount, T.VIA_BANK,
-                   TRIM(CONCAT(
+                    SUM(IF(T.TYPE IN ($exp_types_str), -1 * T.AMOUNT, T.AMOUNT)) as total_amount, T.VIA_BANK,
+                    TRIM(CONCAT(
                         IFNULL(CONCAT_WS(' ', MAX(p.NAME_PREFIX), MAX(p.NAME), MAX(p.NAME_SUFFIX)), ''), 
                         ' ', 
                         IFNULL(MAX(nt1.NAME), ''),
@@ -365,10 +374,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['
             LEFT JOIN ots.PERSONS p ON T.PERSON_ID = p.id
             LEFT JOIN ots.NAMES_OF_TRANSACTION nt1 ON T.NAME_ID = nt1.id
             LEFT JOIN ots.NAMES_OF_TRANSACTION nt2 ON T.NAME2_ID = nt2.id
-            WHERE T.CASH_DOCUMENT_NUMBER != ''
-            GROUP BY T.RECORD_ID, T.CHURCH_ID, T.CASH_DOCUMENT_NUMBER, T.VIA_BANK
-            HAVING ABS(SUM(IF(T.TYPE IN ($exp_types_str), -1 * T.AMOUNT, T.AMOUNT))) = ?
-            ORDER BY ots_date DESC LIMIT 25";
+             WHERE T.CASH_DOCUMENT_NUMBER != '' $church_where
+             GROUP BY T.RECORD_ID, T.CHURCH_ID, T.CASH_DOCUMENT_NUMBER, T.VIA_BANK
+             HAVING ABS(SUM(IF(T.TYPE IN ($exp_types_str), -1 * T.AMOUNT, T.AMOUNT))) = ?
+             ORDER BY ots_date DESC LIMIT 25";
             
     $stmt = $conn->prepare($sql);
     if ($stmt) {
