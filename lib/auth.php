@@ -1,6 +1,7 @@
 <?php
 require_once __DIR__ . '/bootstrap.php';
-require_once __DIR__ . '/../ots/constant.php';
+// OTS constants live outside the revizor directory (../ots). From lib/ we need to go up two levels.
+require_once __DIR__ . '/../../ots/constant.php';
 
 function require_login() {
     if (!isset($_SESSION[GC_LOGIN_COOKIE])) {
@@ -20,14 +21,18 @@ function is_revizor() {
 }
 
 function get_accessible_church_ids() {
+    // If already populated in session, return it
     if (isset($_SESSION['revizor_accessible_churches']) && is_array($_SESSION['revizor_accessible_churches'])) {
         return array_map('intval', $_SESSION['revizor_accessible_churches']);
     }
-    // fallback: if admin, return empty array to indicate all
-    if (is_admin()) return [];
-    // demo fallback
-    $cfg = load_app_config();
-    if (!empty($cfg['demo_mode'])) return [(int)$cfg['demo_reviewer_church_id']];
+    // Admins have access to all churches -> return null to indicate no restriction
+    if (is_admin()) return null;
+    // Otherwise, try to build from OTS roles now
+    build_user_context_from_ots();
+    if (isset($_SESSION['revizor_accessible_churches']) && is_array($_SESSION['revizor_accessible_churches'])) {
+        return array_map('intval', $_SESSION['revizor_accessible_churches']);
+    }
+    // No access
     return [];
 }
 
