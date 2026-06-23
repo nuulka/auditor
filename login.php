@@ -13,8 +13,9 @@ if (isset($_GET['check'])) {
 if (session_status() != PHP_SESSION_ACTIVE) { session_start(); }
 $just_logged_in = isset($_GET['ots_ready']) && isset($_SESSION[GC_LOGIN_COOKIE]);
 if ($just_logged_in) {
-    // build revizor user context from OTS roles
+    // ensure session handler has populated OTS session vars, then build revizor user context
     try {
+        require_once __DIR__ . '/../ots/session_handler.php';
         require_once __DIR__ . '/lib/bootstrap.php';
         require_once __DIR__ . '/lib/auth.php';
         // populate accessible churches from OTS ROLES
