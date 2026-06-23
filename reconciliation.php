@@ -87,11 +87,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['
             echo json_encode(['status' => 'ERROR', 'message' => 'Invalid church_id']);
             exit;
         }
-        // only admin can list custom patterns for arbitrary church; revizor can list for own churches
-        if (!is_admin()) {
-            // check requested church is in accessible list
-            require_church_access($church_id);
-        }
+        // admin or revizor of that church can list patterns
+        require_church_access($church_id);
         $res = $conn->query("SELECT id, church_id, bank_pattern, ots_pattern, label FROM custom_patterns WHERE church_id = $church_id ORDER BY id");
         $items = [];
         while ($r = $res->fetch_assoc()) {
@@ -106,6 +103,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['
         $bank_pattern = trim($_POST['bank_pattern'] ?? '');
         $ots_pattern = trim($_POST['ots_pattern'] ?? '');
         $label = trim($_POST['label'] ?? '');
+        // only admin can add custom patterns
+        if (!is_admin()) {
+            echo json_encode(['status' => 'ERROR', 'message' => 'Only admin can add custom patterns']);
+            exit;
+        }
         if ($church_id <= 0 || empty($bank_pattern) || empty($ots_pattern)) {
             echo json_encode(['status' => 'ERROR', 'message' => 'church_id, bank_pattern and ots_pattern required']);
             exit;
@@ -125,6 +127,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['
         $bank_pattern = trim($_POST['bank_pattern'] ?? '');
         $ots_pattern = trim($_POST['ots_pattern'] ?? '');
         $label = trim($_POST['label'] ?? '');
+        // only admin can edit
+        if (!is_admin()) { echo json_encode(['status' => 'ERROR', 'message' => 'Only admin can edit']); exit; }
         if ($id <= 0 || empty($bank_pattern) || empty($ots_pattern)) {
             echo json_encode(['status' => 'ERROR', 'message' => 'id, bank_pattern and ots_pattern required']);
             exit;
@@ -137,6 +141,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['
     }
 
     if ($sub === 'delete') {
+        // only admin can delete
+        if (!is_admin()) { echo json_encode(['status' => 'ERROR', 'message' => 'Only admin can delete']); exit; }
         $id = isset($_POST['id']) ? intval($_POST['id']) : 0;
         if ($id <= 0) {
             echo json_encode(['status' => 'ERROR', 'message' => 'id required']);
@@ -417,7 +423,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['
         exit;
     }
     header('Content-Type: application/json');
-    
+    // only admin may run auto-match
+    if (!is_admin()) { echo json_encode(['status' => 'ERROR', 'message' => 'Only admin may run auto-match']); exit; }
+
     $mode = $_POST['match_mode'] ?? 'progressive';
     $custom_days = isset($_POST['custom_days']) ? intval($_POST['custom_days']) : 0;
     $filter_church_id = isset($_POST['church_id']) ? intval($_POST['church_id']) : 0;
@@ -1153,6 +1161,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['
         echo json_encode(['status' => 'ERROR', 'message' => 'Hiányzó gyülekezet']);
         exit;
     }
+    // scope check
+    require_church_access($church_id);
 
     $start_date = !empty($ots_date) ? date('Y-m-d', strtotime("$ots_date -90 days")) : '1970-01-01';
     $end_date = !empty($ots_date) ? date('Y-m-d', strtotime("$ots_date +90 days")) : date('Y-m-d', strtotime('+90 days'));
@@ -1198,6 +1208,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['
         echo json_encode(['status' => 'ERROR', 'message' => 'Hiányzó paraméter']);
         exit;
     }
+
+    // scope check
+    require_church_access($church_id);
 
     // OTS adatok lekérése az összeg pontosításhoz
     $ots_check = $conn->query("SELECT adjusted_amount FROM (
@@ -1269,6 +1282,12 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['
         echo json_encode(['status' => 'ERROR', 'message' => 'Hiányzó paraméterek']);
         exit;
     }
+
+    // ensure user may modify this bank_reconciliation record
+    $row_q = $conn->query("SELECT church_id FROM bank_reconciliation WHERE id=$id");
+    if (!$row_q || $row_q->num_rows === 0) { echo json_encode(['status'=>'ERROR','message'=>'Record not found']); exit; }
+    $row = $row_q->fetch_assoc();
+    require_church_access(intval($row['church_id']));
 
     // Töröljük a korábbi items rekordokat
     $conn->query("DELETE FROM bank_reconciliation_items WHERE reconciliation_id = $id");
