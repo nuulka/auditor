@@ -6,6 +6,9 @@ _dev/
 # Temp files
 tmp/
 
+# Local secrets
+config/app.local.php
+
 # OS
 Thumbs.db
 .DS_Store

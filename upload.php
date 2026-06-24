@@ -22,34 +22,18 @@ if (!isset($_SESSION[GC_LOGIN_COOKIE])) {
 // Access control: only admin can use upload interface
 require_once __DIR__ . '/lib/bootstrap.php';
 require_once __DIR__ . '/lib/auth.php';
-if (!is_admin()) {
-    header('Location: index.php');
-    exit;
-}
+require_once __DIR__ . '/lib/session.php';
+$is_admin = is_admin();
 
-if (empty($_SESSION['csrf_token'])) {
-    $_SESSION['csrf_token'] = bin2hex(random_bytes(32));
-}
 
 // Revizor Asszisztens session timeout — 20 perc, OTS 10 perces idejét felülírja
-define('REVIZOR_SESSION_DURATION', 1200);
-$_SESSION[GN_LAST_ACTIVE] = time();
-if (!isset($_SESSION['revizor_expires_at'])) {
-    $_SESSION['revizor_expires_at'] = time() + REVIZOR_SESSION_DURATION;
-}
-if (time() >= $_SESSION['revizor_expires_at']) {
-    session_destroy();
-    header('Location: login.php');
-    exit;
-}
-$session_remaining = $_SESSION['revizor_expires_at'] - time();
+$session_remaining = ensure_revizor_session_timeout();
+ensure_revizor_csrf_token();
 
-$conn = new mysqli('localhost', 'root', '', 'revizor_db');
-if ($conn->connect_error) { die("Adatbázis hiba: " . $conn->connect_error); }
-$conn->set_charset("utf8mb4");
+$conn = get_revizor_conn();
 
 $church_options = [];
-$church_result = $conn->query("SELECT id, name FROM ots.churches ORDER BY name ASC");
+$church_result = get_ots_conn()->query("SELECT id, name FROM churches ORDER BY name ASC");
 if ($church_result) {
     while ($row = $church_result->fetch_assoc()) {
         $church_options[] = $row;
@@ -63,32 +47,30 @@ foreach ($church_options as $c) {
 }
 
 $church_account_map = [];
+$skip_account_map = [];
+$account_config_rows = [];
 
 // Gyülekezeti bankszámlák betöltése az adatbázisból
-$cba_result = $conn->query("SELECT church_id, bank_account_clean, bank_name FROM church_bank_accounts WHERE bank_account_clean IS NOT NULL AND bank_account_clean != ''");
+$cba_result = $conn->query("SELECT id, church_id, bank_account, bank_account_clean, bank_name, skip_import FROM church_bank_accounts WHERE bank_account_clean IS NOT NULL AND bank_account_clean != '' ORDER BY church_id ASC, bank_account_clean ASC");
 if ($cba_result) {
     while ($cba = $cba_result->fetch_assoc()) {
-        $church_account_map[$cba['bank_account_clean']] = (int)$cba['church_id'];
+        $cid = (int)$cba['church_id'];
+        $clean = $cba['bank_account_clean'];
+        $account_config_rows[] = $cba;
+        if (!empty($cba['skip_import'])) {
+            $skip_account_map[$clean] = true;
+        }
+        if ($cid > 0) {
+            $church_account_map[$clean] = $cid;
+        }
     }
 }
 
 // Segédfüggvény az emberbarát név feloldásához a számlaszám alapján
-$resolveFriendlyName = function($acc, $defaultName) use ($church_account_map, $church_names, $conn) {
+$resolveFriendlyName = function($acc, $defaultName) use ($church_account_map, $church_names) {
     $cleanAcc = preg_replace('/[^0-9]/', '', $acc);
     if (isset($church_account_map[$cleanAcc])) {
         $cid = $church_account_map[$cleanAcc];
-        if ($cid === 0) {
-            // Egyházterületi számla: név a church_bank_accounts táblából
-                                $stmt_acc = $conn->prepare("SELECT bank_name FROM church_bank_accounts WHERE bank_account_clean = ? LIMIT 1");
-                                if ($stmt_acc) {
-                                    $stmt_acc->bind_param('s', $bank_acc_clean);
-                                    $stmt_acc->execute();
-                                    $res_acc = $stmt_acc->get_result();
-                                    if ($res_acc && ($row_acc = $res_acc->fetch_assoc())) {
-                                        return $row_acc['bank_name'] ?: $defaultName;
-                                    }
-                                }
-        }
         return $church_names[$cid] ?? $defaultName;
     }
     return $defaultName;
@@ -154,14 +136,90 @@ $conn->query("CREATE TABLE IF NOT EXISTS bank_reconciliation_items (
     FOREIGN KEY (reconciliation_id) REFERENCES bank_reconciliation(id) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4");
 
+function insert_ots_items($conn, $reconciliation_id, $record_id, $church_id, $exp_types, $extra_where = '') {
+    $w = trim($extra_where);
+    $w_clause = ($w !== '') ? " AND $w" : '';
+    $sql = "SELECT id, AMOUNT, TYPE, CASH_DOCUMENT_NUMBER, DATETIME FROM ots.TRANSACTIONS WHERE RECORD_ID = ? AND CHURCH_ID = ?$w_clause ORDER BY id";
+    $st = $conn->prepare($sql);
+    $st->bind_param("ii", $record_id, $church_id);
+    $st->execute();
+    $res = $st->get_result();
+    $dates = [];
+    $docs = [];
+    $any = false;
+    if ($res && $res->num_rows > 0) {
+        $ins = $conn->prepare("INSERT INTO bank_reconciliation_items (reconciliation_id, record_id, amount) VALUES (?, ?, ?)");
+        while ($it = $res->fetch_assoc()) {
+            $adj = in_array((int)$it['TYPE'], $exp_types) ? -1.0 * (float)$it['AMOUNT'] : (float)$it['AMOUNT'];
+            $ins->bind_param("iid", $reconciliation_id, $record_id, $adj);
+            $ins->execute();
+            $any = true;
+            $dates[] = $it['DATETIME'];
+            if (!empty($it['CASH_DOCUMENT_NUMBER']) && $it['CASH_DOCUMENT_NUMBER'] !== '0000') {
+                $docs[] = $it['CASH_DOCUMENT_NUMBER'];
+            }
+        }
+    }
+    if (!$any) {
+        $ins = $conn->prepare("INSERT INTO bank_reconciliation_items (reconciliation_id, record_id, amount) VALUES (?, ?, ?)");
+        $zero = 0.0;
+        $ins->bind_param("iid", $reconciliation_id, $record_id, $zero);
+        $ins->execute();
+    }
+    return [
+        'ots_date' => !empty($dates) ? substr(min($dates), 0, 10) : null,
+        'ots_doc' => !empty($docs) ? implode(', ', array_unique($docs)) : (string)$record_id
+    ];
+}
+
 $message = "";
+if (isset($_GET['saved']) && $_GET['saved'] === 'skip') {
+    $message = "<div class='alert alert-success'>✅ Figyelmen kívül hagyás beállítások mentve.</div>";
+}
 
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     if (!isset($_POST['csrf_token']) || $_POST['csrf_token'] !== $_SESSION['csrf_token']) {
         $message = "<div class='alert alert-danger'>CSRF token mismatch!</div>";
     } else {
+    if (isset($_POST['save_skip_config'])) {
+        if (!$is_admin) {
+            $message = "<div class='alert alert-danger'>Nincs jogosultság a beállításhoz.</div>";
+        } else {
+            $selected_ids = [];
+            if (isset($_POST['skip_import']) && is_array($_POST['skip_import'])) {
+                foreach ($_POST['skip_import'] as $sid) {
+                    $sid = intval($sid);
+                    if ($sid > 0) { $selected_ids[] = $sid; }
+                }
+            }
+
+            $conn->begin_transaction();
+            try {
+                $conn->query("UPDATE church_bank_accounts SET skip_import = 0");
+                if (!empty($selected_ids)) {
+                    $placeholders = implode(',', array_fill(0, count($selected_ids), '?'));
+                    $stmt_skip = $conn->prepare("UPDATE church_bank_accounts SET skip_import = 1 WHERE id IN ($placeholders)");
+                    if ($stmt_skip) {
+                        $types = str_repeat('i', count($selected_ids));
+                        $stmt_skip->bind_param($types, ...$selected_ids);
+                        $stmt_skip->execute();
+                    }
+                }
+                $conn->commit();
+                header('Location: upload.php?saved=skip');
+                exit;
+            } catch (Throwable $e) {
+                $conn->rollback();
+                $message = "<div class='alert alert-danger'>Mentési hiba: " . htmlspecialchars($e->getMessage()) . "</div>";
+            }
+        }
+    }
     // --- EGYEDI GYÜLEKEZET FELTÖLTÉS ---
     if (isset($_POST['single_upload']) && isset($_FILES['bank_file'])) {
+    if (!$is_admin) {
+        $message = "<div class='alert alert-danger'>Csak adminisztrátor tölthet fel kézzel.</div>";
+        $errors_found = true;
+    } else {
     // Mivel datalist-et használunk, a beírt szövegből (pl: "Kiskunhalas (ID: 12)") kibányásszuk az ID-t
     $church_input = $_POST['church_search'] ?? '';
     preg_match('/\(ID:\s*(\d+)\)/', $church_input, $matches);
@@ -289,21 +347,23 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                                     if ($ots_doc_clean === '0000') $ots_doc_clean = '';
                                     $ots_record_id = $ots_row['RECORD_ID'] ?? 0;
                                     
+                                     // Insert individual OTS items (handles TYPE=1 multi-item record_ids)
+                                    if ($ots_record_id > 0) {
+                                        $item_info = insert_ots_items($conn, $new_id, $ots_record_id, $church_id, $exp_types, "VIA_BANK <> 0");
+                                        if ($item_info['ots_date'] !== null) $ots_date_only = $item_info['ots_date'];
+                                        if ($item_info['ots_doc'] !== null) $ots_doc_clean = $item_info['ots_doc'];
+                                    }
+                                    
                                     $new_status = ($ots_date_only === $bank_date) ? 'OK' : 'CSUSZAS';
                                     $comment = ($ots_date_only === $bank_date) ? '[Auto: 100% egyezés, 0 nap]' : '[Auto: +/- 5 nap csúszás, egyetlen találat]';
                                     
                                     $upd_stmt = $conn->prepare("UPDATE bank_reconciliation SET ots_date=?, ots_doc=?, ots_record_id=?, ots_amount=?, status=?, comment=? WHERE id=?");
                                     $upd_stmt->bind_param("ssidssi", $ots_date_only, $ots_doc_clean, $ots_record_id, $bank_amount, $new_status, $comment, $new_id);
                                     $upd_stmt->execute();
-                                    if ($ots_record_id > 0) {
-                                        $ins_item = $conn->prepare("INSERT INTO bank_reconciliation_items (reconciliation_id, record_id, amount) VALUES (?, ?, ?)");
-                                        $ins_item->bind_param("iid", $new_id, $ots_record_id, $bank_amount);
-                                        $ins_item->execute();
-                                    }
                                     $auto_matched++;
                                 } elseif (!$ots_result || $ots_result->num_rows !== 1) {
                                     // Nem talált OTS-t, próbáljuk a transfers_to_conference-t
-                                    $tc_stmt = $conn->prepare("SELECT AMOUNT, CONCAT(YEAR, '-', LPAD(MONTH, 2, '0'), '-', LPAD(DAY, 2, '0')) AS ots_date, CASH_DOCUMENT_NUMBER AS ots_doc FROM ots.transfers_to_conference WHERE CHURCH_ID = ? AND VIA_BANK = 1 AND AMOUNT = ? AND CONCAT(YEAR, '-', LPAD(MONTH, 2, '0'), '-', LPAD(DAY, 2, '0')) BETWEEN DATE_SUB(?, INTERVAL 5 DAY) AND DATE_ADD(?, INTERVAL 5 DAY) LIMIT 1");
+                                    $tc_stmt = $conn->prepare("SELECT AMOUNT, CONCAT(YEAR, '-', LPAD(MONTH, 2, '0'), '-', LPAD(DAY, 2, '0')) AS ots_date, CASH_DOCUMENT_NUMBER AS ots_doc FROM ots.transfers_to_conference WHERE CHURCH_ID = ? AND VIA_BANK = 1 AND AMOUNT = ABS(?) AND CONCAT(YEAR, '-', LPAD(MONTH, 2, '0'), '-', LPAD(DAY, 2, '0')) BETWEEN DATE_SUB(?, INTERVAL 45 DAY) AND DATE_ADD(?, INTERVAL 45 DAY) LIMIT 1");
                                     if ($tc_stmt) {
                                         $tc_stmt->bind_param("idss", $church_id, $bank_amount, $bank_date, $bank_date);
                                         $tc_stmt->execute();
@@ -339,10 +399,13 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         }
     }
     }
+    }
     // --- TÖBB GYÜLEKEZETES AUTOMATIKUS FELTÖLTÉS ---
     elseif (isset($_POST['multi_upload']) && isset($_FILES['multi_bank_file'])) {
         $file = $_FILES['multi_bank_file'];
         if ($file['error'] === UPLOAD_ERR_OK) {
+            $ext = strtolower(pathinfo($file['name'], PATHINFO_EXTENSION));
+            if (in_array($ext, ['csv', 'txt'])) {
             $file_content = file_get_contents($file['tmp_name']);
             if (substr($file_content, 0, 3) == pack("CCC", 0xef, 0xbb, 0xbf)) { $file_content = substr($file_content, 3); }
             if (!mb_check_encoding($file_content, 'UTF-8')) { $file_content = iconv('CP1250', 'UTF-8//IGNORE', $file_content); }
@@ -437,18 +500,20 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                                     $ots_result = $stmt_ots->get_result();
                                     if ($ots_result && $ots_result->num_rows === 1) {
                                         $ots_row = $ots_result->fetch_assoc();
+                                        $ots_date_val = $ots_row['ots_date'] ? substr($ots_row['ots_date'], 0, 10) : null;
                                         $ots_doc_final = $ots_row['ots_doc'] ?? '';
                                         if ($ots_doc_final === '0000') $ots_doc_final = '';
-                                        $new_status = ($ots_row['ots_date'] == $bank_date) ? 'OK' : 'CSUSZAS';
                                         $ots_record_id = $ots_row['RECORD_ID'] ?? null;
-                                        $upd = $conn->prepare("UPDATE bank_reconciliation SET ots_date=?, ots_doc=?, ots_record_id=?, ots_amount=?, status=? WHERE id=?");
-                                        $upd->bind_param("ssidsi", $ots_row['ots_date'], $ots_doc_final, $ots_record_id, $bank_amount, $new_status, $new_id);
-                                        $upd->execute();
-                                        if (!empty($ots_row['RECORD_ID'])) {
-                                            $ins_item = $conn->prepare("INSERT INTO bank_reconciliation_items (reconciliation_id, record_id, amount) VALUES (?, ?, ?)");
-                                            $ins_item->bind_param("iid", $new_id, $ots_row['RECORD_ID'], $bank_amount);
-                                            $ins_item->execute();
+                                        // Insert individual OTS items (handles TYPE=1 multi-item record_ids)
+                                        if (!empty($ots_record_id)) {
+                                            $item_info = insert_ots_items($conn, $new_id, $ots_record_id, $church_id, $exp_types, "VIA_BANK <> 0");
+                                            if ($item_info['ots_date'] !== null) $ots_date_val = $item_info['ots_date'];
+                                            if ($item_info['ots_doc'] !== null) $ots_doc_final = $item_info['ots_doc'];
                                         }
+                                        $new_status = ($ots_date_val == $bank_date) ? 'OK' : 'CSUSZAS';
+                                        $upd = $conn->prepare("UPDATE bank_reconciliation SET ots_date=?, ots_doc=?, ots_record_id=?, ots_amount=?, status=? WHERE id=?");
+                                        $upd->bind_param("ssidsi", $ots_date_val, $ots_doc_final, $ots_record_id, $bank_amount, $new_status, $new_id);
+                                        $upd->execute();
                                         $auto_matched++;
                                     }
                                 }
@@ -463,9 +528,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                         $conn->rollback();
                         $message = "<div class='alert alert-danger'>Hiba: " . $e->getMessage() . "</div>";
                     }
-                }
             }
         }
+        }
+    }
     }
     } // CSRF else block vége
 }
@@ -488,6 +554,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['
     $file = $_FILES['multi_bank_file'];
     if ($file['error'] !== UPLOAD_ERR_OK) {
         echo json_encode(['status' => 'ERROR', 'message' => 'Fájl hiba: ' . $file['error']]);
+        exit;
+    }
+    $ext = strtolower(pathinfo($file['name'], PATHINFO_EXTENSION));
+    if (!in_array($ext, ['csv', 'txt'])) {
+        echo json_encode(['status' => 'ERROR', 'message' => 'Csak CSV vagy TXT fájl tölthető fel!']);
         exit;
     }
     $start_upload = microtime(true);
@@ -516,6 +587,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['
         exit;
     }
     $inserted = 0; $skipped = 0; $duplicate = 0; $seen_in_file = [];
+    $skipped_config = 0; $skipped_unmapped = 0;
+    $dup_details = [];
     $conn->begin_transaction();
     try {
         for ($i = 1; $i < count($lines); $i++) {
@@ -535,11 +608,24 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['
             $lookup_acc_raw = $is_incoming ? $ben_acc_raw : $init_acc_raw;
             $clean_lookup_acc = preg_replace('/[^0-9]/', '', $lookup_acc_raw);
             $church_id = $church_account_map[$clean_lookup_acc] ?? 0;
-            if ($church_id === 0 && $idx_own_acc !== FALSE) {
+            $own_acc = '';
+            if ($idx_own_acc !== FALSE) {
                 $own_acc = preg_replace('/[^0-9]/', '', $row[$idx_own_acc] ?? '');
-                $church_id = $church_account_map[$own_acc] ?? 0;
+                if ($church_id === 0) {
+                    $church_id = $church_account_map[$own_acc] ?? 0;
+                }
             }
-            if ($church_id === 0) { $skipped++; continue; }
+            $is_config_skip = (!empty($clean_lookup_acc) && isset($skip_account_map[$clean_lookup_acc])) || (!empty($own_acc) && isset($skip_account_map[$own_acc]));
+            if ($is_config_skip) {
+                $skipped++;
+                $skipped_config++;
+                continue;
+            }
+            if ($church_id === 0) {
+                $skipped++;
+                $skipped_unmapped++;
+                continue;
+            }
             $bank_desc = trim($row[$idx_desc] ?? '', " \"");
             $init_name_raw = $resolveFriendlyName($init_acc_raw, trim($row[$idx_init_name] ?? '', " \""));
             $ben_name_raw = $resolveFriendlyName($ben_acc_raw, trim($row[$idx_partner_name] ?? '', " \""));
@@ -558,13 +644,36 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['
                 $stmt->execute();
                 $inserted++;
             } catch (mysqli_sql_exception $e) {
-                if ($e->getCode() === 1062) { $skipped++; $duplicate++; continue; }
+                if ($e->getCode() === 1062) {
+                    $skipped++; $duplicate++;
+                    $dup_date = $bank_date;
+                    $dup_amount = number_format(abs($bank_amount), 0, ',', ' ') . ' Ft';
+                    $dup_desc = mb_substr($bank_desc, 0, 40);
+                    $dup_key = "$dup_date $dup_amount $dup_desc";
+                    if (!isset($dup_details[$dup_key])) { $dup_details[$dup_key] = 0; }
+                    $dup_details[$dup_key]++;
+                    continue;
+                }
                 throw $e;
             }
         }
         $conn->commit();
         $elapsed = round(microtime(true) - $start_upload, 2);
-        echo json_encode(['status' => 'OK', 'inserted' => $inserted, 'skipped' => $skipped, 'duplicate' => $duplicate, 'time_sec' => $elapsed]);
+        $dup_list = [];
+        arsort($dup_details);
+        foreach ($dup_details as $desc => $cnt) {
+            $dup_list[] = "$desc ($cnt db)";
+        }
+        echo json_encode([
+            'status' => 'OK',
+            'inserted' => $inserted,
+            'skipped' => $skipped,
+            'duplicate' => $duplicate,
+            'skipped_config' => $skipped_config,
+            'skipped_unmapped' => $skipped_unmapped,
+            'time_sec' => $elapsed,
+            'dup_details' => $dup_list
+        ]);
     } catch (Exception $e) {
         $conn->rollback();
         echo json_encode(['status' => 'ERROR', 'message' => $e->getMessage()]);
@@ -578,6 +687,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['action'] === 'progressive_match_pass') {
     // only admin allowed
     if (!is_admin()) { echo json_encode(['status'=>'ERROR','message'=>'Only admin allowed']); exit; }
+    session_write_close();
     header('Content-Type: application/json');
     try {
         if (!isset($_POST['csrf_token']) || $_POST['csrf_token'] !== $_SESSION['csrf_token']) {
@@ -594,46 +704,71 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['
             $total_unchecked = (int)$unc_res->fetch_assoc()['cnt'];
         }
         $matched = 0;
+        // progress file for frontend polling (shows per-church progress)
+        $progress_file = sys_get_temp_dir() . DIRECTORY_SEPARATOR . 'revizor_progress_' . session_id() . '.json';
+        // initialize progress
+        @file_put_contents($progress_file, json_encode(['status'=>'RUNNING','matched'=>0,'total_unchecked'=>$total_unchecked,'current_church'=>null,'processed_churches'=>0,'processed_records'=>0,'time_sec'=>0]));
         if ($pass_index < 6) {
         $days = $pass_days[$pass_index];
         $church_res = $conn->query("SELECT DISTINCT church_id FROM bank_reconciliation WHERE status = 'UNCHECKED'");
         while ($c = $church_res->fetch_assoc()) {
             $cid = $c['church_id'];
+            $processed_churches = isset($processed_churches) ? $processed_churches : 0;
+            $processed_records = isset($processed_records) ? $processed_records : 0;
+            // update progress: current church
+            @file_put_contents($progress_file, json_encode(['status'=>'RUNNING','matched'=>$matched,'total_unchecked'=>$total_unchecked,'current_church'=>$cid,'processed_churches'=>$processed_churches,'processed_records'=>$processed_records,'time_sec'=>round(microtime(true)-$start_pass,2)]));
                 $stmt_recs = $conn->prepare("SELECT id, bank_date, bank_amount FROM bank_reconciliation WHERE church_id = ? AND status = 'UNCHECKED'");
                 if ($stmt_recs) {
                     $stmt_recs->bind_param('i', $cid);
                     $stmt_recs->execute();
                     $rec_res = $stmt_recs->get_result();
                 } else {
-                    $rec_res = $conn->query("SELECT id, bank_date, bank_amount FROM bank_reconciliation WHERE church_id = $cid AND status = 'UNCHECKED'");
+                    $rec_res = false;
                 }
                 while ($rec = $rec_res->fetch_assoc()) {
                 $used_sub = "(SELECT ots_record_id FROM bank_reconciliation WHERE ots_record_id IS NOT NULL UNION SELECT record_id FROM bank_reconciliation_items)";
                 $ots_query = "SELECT MAX(CASH_DOCUMENT_NUMBER) AS ots_doc, MAX(DATETIME) AS ots_date, RECORD_ID FROM ots.TRANSACTIONS WHERE CHURCH_ID = ? AND DATETIME BETWEEN DATE_SUB(?, INTERVAL ? DAY) AND DATE_ADD(?, INTERVAL ? DAY) AND VIA_BANK <> 0 AND RECORD_ID NOT IN $used_sub GROUP BY RECORD_ID HAVING SUM(IF(TYPE IN ($exp_types_str), -1 * AMOUNT, AMOUNT)) = ?";
                 $stmt = $conn->prepare($ots_query);
                 if ($stmt) {
-                    $stmt->bind_param("isidd", $cid, $rec['bank_date'], $days, $rec['bank_date'], $rec['bank_amount']);
+                    $stmt->bind_param("isisid", $cid, $rec['bank_date'], $days, $rec['bank_date'], $days, $rec['bank_amount']);
                     $stmt->execute();
                     $ots_res = $stmt->get_result();
-                    if ($ots_res && $ots_res->num_rows === 1) {
+                        if ($ots_res && $ots_res->num_rows === 1) {
                         $ots_row = $ots_res->fetch_assoc();
                         $ots_date = $ots_row['ots_date'] ? substr($ots_row['ots_date'], 0, 10) : null;
                         $ots_doc = $ots_row['ots_doc'] ?? '';
                         if ($ots_doc === '0000') $ots_doc = '';
                         $rid = $ots_row['RECORD_ID'] ?? 0;
+                        // Insert individual OTS items (handles TYPE=1 multi-item record_ids)
+                        if ($rid > 0) {
+                            $item_info = insert_ots_items($conn, $rec['id'], $rid, $cid, $exp_types, "VIA_BANK <> 0");
+                            if ($item_info['ots_date'] !== null) $ots_date = $item_info['ots_date'];
+                            if ($item_info['ots_doc'] !== null) $ots_doc = $item_info['ots_doc'];
+                        }
+                        // Sanity check: OTS must not be more than 30 days BEFORE bank date
+                        if ($ots_date !== null) {
+                            $ots_ts = strtotime($ots_date);
+                            $bank_ts = strtotime($rec['bank_date']);
+                            if ($ots_ts && $bank_ts && ($bank_ts - $ots_ts) > 30 * 86400) {
+                                continue; // OTS too far before bank, skip this record
+                            }
+                        }
                         $ns = ($ots_date == $rec['bank_date']) ? 'OK' : 'CSUSZAS';
                         $cm = ($days == 0) ? '[Auto: 0 napos]' : "[Auto: {$days} napos]";
                         $upd = $conn->prepare("UPDATE bank_reconciliation SET ots_date=?, ots_doc=?, ots_record_id=?, ots_amount=?, status=?, comment=? WHERE id=?");
                         $upd->bind_param("ssidssi", $ots_date, $ots_doc, $rid, $rec['bank_amount'], $ns, $cm, $rec['id']);
                         $upd->execute();
-                        if ($rid > 0) {
-                            $ii = $conn->prepare("INSERT INTO bank_reconciliation_items (reconciliation_id, record_id, amount) VALUES (?, ?, ?)");
-                            $ii->bind_param("iid", $rec['id'], $rid, $rec['bank_amount']);
-                            $ii->execute();
+                                    $matched++;
+                                }
+                        // update per-record progress every 50 records
+                        $processed_records++;
+                        if (($processed_records % 50) === 0) {
+                            @file_put_contents($progress_file, json_encode(['status'=>'RUNNING','matched'=>$matched,'total_unchecked'=>$total_unchecked,'current_church'=>$cid,'processed_churches'=>$processed_churches,'processed_records'=>$processed_records,'time_sec'=>round(microtime(true)-$start_pass,2)]));
                         }
-                        $matched++;
-                    }
                 }
+                // finished a church
+                $processed_churches++;
+                @file_put_contents($progress_file, json_encode(['status'=>'RUNNING','matched'=>$matched,'total_unchecked'=>$total_unchecked,'current_church'=>null,'processed_churches'=>$processed_churches,'processed_records'=>$processed_records,'time_sec'=>round(microtime(true)-$start_pass,2)]));
             }
         }
     } else {
@@ -666,15 +801,15 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['
                     $stmt_recs2->execute();
                     $rec_res = $stmt_recs2->get_result();
                 } else {
-                    $rec_res = $conn->query("SELECT id, bank_date, bank_amount, bank_desc FROM bank_reconciliation WHERE church_id = $cid AND status = 'UNCHECKED'");
+                    $rec_res = false;
                 }
             while ($rec = $rec_res->fetch_assoc()) {
                 $bd = mb_strtolower(trim($rec['bank_desc'] ?? ''), 'UTF-8');
                 if (empty($bd)) continue;
                 $used_sub = "(SELECT ots_record_id FROM bank_reconciliation WHERE ots_record_id IS NOT NULL UNION SELECT record_id FROM bank_reconciliation_items)";
-                $os = $conn->prepare("SELECT t.RECORD_ID, MAX(t.DATETIME) AS ots_date, MAX(t.CASH_DOCUMENT_NUMBER) AS ots_doc, MAX(COALESCE(notn.NAME, '')) AS ots_reason FROM ots.TRANSACTIONS t LEFT JOIN ots.names_of_transaction notn ON t.NAME_ID = notn.id WHERE t.CHURCH_ID = ? AND t.RECORD_ID NOT IN $used_sub GROUP BY t.RECORD_ID HAVING SUM(IF(t.TYPE IN ($exp_types_str), -1 * t.AMOUNT, t.AMOUNT)) = ?");
+                $os = $conn->prepare("SELECT t.RECORD_ID, MAX(t.DATETIME) AS ots_date, MAX(t.CASH_DOCUMENT_NUMBER) AS ots_doc, MAX(COALESCE(notn.NAME, '')) AS ots_reason FROM ots.TRANSACTIONS t LEFT JOIN ots.names_of_transaction notn ON t.NAME_ID = notn.id WHERE t.CHURCH_ID = ? AND t.VIA_BANK <> 0 AND t.DATETIME BETWEEN DATE_SUB(?, INTERVAL 90 DAY) AND DATE_ADD(?, INTERVAL 90 DAY) AND t.RECORD_ID NOT IN $used_sub GROUP BY t.RECORD_ID HAVING SUM(IF(t.TYPE IN ($exp_types_str), -1 * t.AMOUNT, t.AMOUNT)) = ?");
                 if (!$os) continue;
-                $os->bind_param("id", $cid, $rec['bank_amount']);
+                $os->bind_param("issd", $cid, $rec['bank_date'], $rec['bank_date'], $rec['bank_amount']);
                 $os->execute();
                 $or = $os->get_result();
                 $best_score = 0; $best_ots = null;
@@ -707,23 +842,37 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['
                     $ots_doc = $best_ots['ots_doc'] ?? '';
                     if ($ots_doc === '0000') $ots_doc = '';
                     $rid = $best_ots['RECORD_ID'] ?? 0;
+                    // Insert individual OTS items (handles TYPE=1 multi-item record_ids)
+                    if ($rid > 0) {
+                        $item_info = insert_ots_items($conn, $rec['id'], $rid, $cid, $exp_types);
+                        if ($item_info['ots_date'] !== null) $ots_date = $item_info['ots_date'];
+                        if ($item_info['ots_doc'] !== null) $ots_doc = $item_info['ots_doc'];
+                    }
+                    // Sanity check: OTS must not be more than 30 days BEFORE bank date
+                    if ($ots_date !== null) {
+                        $ots_ts = strtotime($ots_date);
+                        $bank_ts = strtotime($rec['bank_date']);
+                        if ($ots_ts && $bank_ts && ($bank_ts - $ots_ts) > 30 * 86400) {
+                            continue; // OTS too far before bank, skip this record
+                        }
+                    }
                     $ns = ($ots_date == $rec['bank_date']) ? 'OK' : 'CSUSZAS';
                     $cm = "[Auto: Szöveges, pont:{$best_score}]";
                     $upd = $conn->prepare("UPDATE bank_reconciliation SET ots_date=?, ots_doc=?, ots_record_id=?, ots_amount=?, status=?, comment=? WHERE id=?");
                     $upd->bind_param("ssidssi", $ots_date, $ots_doc, $rid, $rec['bank_amount'], $ns, $cm, $rec['id']);
                     $upd->execute();
-                    if ($rid > 0) {
-                        $ii = $conn->prepare("INSERT INTO bank_reconciliation_items (reconciliation_id, record_id, amount) VALUES (?, ?, ?)");
-                        $ii->bind_param("iid", $rec['id'], $rid, $rec['bank_amount']);
-                        $ii->execute();
-                    }
                     $matched++;
                 }
             }
         }
     }
     $elapsed = round(microtime(true) - $start_pass, 2);
+    // final progress write and remove file after small delay
+    @file_put_contents($progress_file, json_encode(['status'=>'DONE','matched'=>$matched,'total_unchecked'=>$total_unchecked,'current_church'=>null,'processed_churches'=>isset($processed_churches)?$processed_churches:0,'processed_records'=>isset($processed_records)?$processed_records:0,'time_sec'=>$elapsed]));
+    // give client the final result
     echo json_encode(['status' => 'OK', 'pass_name' => $pass_names[$pass_index], 'matched' => $matched, 'total_unchecked' => $total_unchecked, 'time_sec' => $elapsed]);
+    // cleanup progress file after short time (client will poll once more)
+    register_shutdown_function(function() use ($progress_file){ if (file_exists($progress_file)) @unlink($progress_file); });
     exit;
     } catch (Throwable $e) {
         echo json_encode(['status' => 'ERROR', 'message' => $e->getMessage()]);
@@ -799,7 +948,18 @@ document.addEventListener('DOMContentLoaded', function() {
             if (result.status !== 'OK') { panel.innerHTML = '<div class="alert alert-danger">' + result.message + '</div>'; return; }
 
             var skipInfo = result.skipped > 0 ? ' (' + result.skipped + ' kihagyva, ebből ' + result.duplicate + ' duplikált)' : '';
-            panel.innerHTML = '<div class="alert alert-success mb-2">✅ Feltöltve: <strong>' + result.inserted + '</strong> sor' + skipInfo + ' — <strong>' + result.time_sec + ' mp</strong></div>';
+            var skipSummaryHtml = '';
+            if (result.skipped_config && result.skipped_config > 0) {
+                skipSummaryHtml += '<div class="small text-muted mt-1">Kihagyva (config szerint): <strong>' + result.skipped_config + ' db tétel</strong></div>';
+            }
+            if (result.skipped_unmapped && result.skipped_unmapped > 0) {
+                skipSummaryHtml += '<div class="small text-warning mt-1">Nem azonosított számla: ' + result.skipped_unmapped + ' db (állítsd be a church_bank_accounts táblában)</div>';
+            }
+            var dupDetailHtml = '';
+            if (result.duplicate > 0) {
+                dupDetailHtml = '<div class="small text-muted mt-1">Duplikált (már az adatbázisban volt): <strong>' + result.duplicate + ' db</strong></div>';
+            }
+            panel.innerHTML = '<div class="alert alert-success mb-2">✅ Feltöltve: <strong>' + result.inserted + '</strong> sor' + skipInfo + ' — <strong>' + result.time_sec + ' mp</strong>' + skipSummaryHtml + dupDetailHtml + '</div>';
 
             if (result.inserted > 0) {
                 panel.innerHTML += '<div class="text-center py-2"><div class="spinner-border spinner-border-sm text-info me-2"></div>Automatikus párosítás indítása...</div>';
@@ -903,6 +1063,8 @@ document.addEventListener('DOMContentLoaded', function() {
         </div>
     </div>
 
+    <?php if ($is_admin): ?>
+
     <div class="upload-card mb-4">
         <h4 class="mb-3">📥 Egyedi Gyülekezet Feltöltése</h4>
         <?php echo $message; ?>
@@ -920,7 +1082,7 @@ document.addEventListener('DOMContentLoaded', function() {
             </div>
             <div class="mb-4">
                 <label class="form-label fw-bold">2. K&H CSV Fájl:</label>
-                <input class="form-control" type="file" name="bank_file" required>
+                <input class="form-control" type="file" name="bank_file" accept=".csv,.txt" required>
             </div>
             <button type="submit" class="btn btn-primary w-100">Feltöltés</button>
         </form>
@@ -933,16 +1095,73 @@ document.addEventListener('DOMContentLoaded', function() {
             <input type="hidden" name="csrf_token" value="<?php echo htmlspecialchars($_SESSION['csrf_token']); ?>">
             <div class="mb-4">
                 <label class="form-label fw-bold">K&H CSV Fájl:</label>
-                <input class="form-control" type="file" name="multi_bank_file" required>
+                <input class="form-control" type="file" name="multi_bank_file" accept=".csv,.txt" required>
             </div>
             <button type="submit" class="btn btn-success w-100">Összesített Feltöltés</button>
         </form>
         <div id="multiProgress" class="mt-3" style="display:none;"></div>
     </div>
 
+    <div class="upload-card mt-4">
+        <h4 class="mb-3">⚙️ Kihagyandó bankszámlák (import)</h4>
+        <p class="small text-muted mb-3">Jelöld be azokat a számlákat, amelyeket az automatikus tömeges import mindig figyelmen kívül hagyjon.</p>
+        <form action="upload.php" method="POST">
+            <input type="hidden" name="save_skip_config" value="1">
+            <input type="hidden" name="csrf_token" value="<?php echo htmlspecialchars($_SESSION['csrf_token']); ?>">
+            <div class="table-responsive" style="max-height:260px; overflow:auto; border:1px solid #e9ecef; border-radius:10px;">
+                <table class="table table-sm table-striped mb-0 align-middle">
+                    <thead class="table-light" style="position:sticky; top:0; z-index:1;">
+                        <tr>
+                            <th style="width:120px;">Kihagyás</th>
+                            <th style="width:120px;">Church ID</th>
+                            <th>Gyülekezet</th>
+                            <th style="width:220px;">Bankszámla</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <?php foreach ($account_config_rows as $acc_row): ?>
+                            <?php
+                                $cid = (int)$acc_row['church_id'];
+                                $church_label = $church_names[$cid] ?? ($cid === 0 ? 'TET / Intézményi' : 'Ismeretlen gyülekezet');
+                                $clean_acc = preg_replace('/[^0-9]/', '', $acc_row['bank_account_clean'] ?? '');
+                                $acc_mask = strlen($clean_acc) > 12
+                                    ? substr($clean_acc, 0, 8) . '...' . substr($clean_acc, -4)
+                                    : $clean_acc;
+                            ?>
+                            <tr>
+                                <td>
+                                    <div class="form-check form-switch mb-0">
+                                        <input class="form-check-input" type="checkbox" name="skip_import[]" value="<?php echo (int)$acc_row['id']; ?>" <?php echo !empty($acc_row['skip_import']) ? 'checked' : ''; ?>>
+                                    </div>
+                                </td>
+                                <td><?php echo $cid; ?></td>
+                                <td><?php echo htmlspecialchars($church_label); ?></td>
+                                <td><code><?php echo htmlspecialchars($acc_mask); ?></code></td>
+                            </tr>
+                        <?php endforeach; ?>
+                    </tbody>
+                </table>
+            </div>
+            <div class="mt-3 d-flex justify-content-end">
+                <button type="submit" class="btn btn-outline-primary btn-sm">Mentés</button>
+            </div>
+        </form>
+    </div>
+
         <!-- Progress Panel -->
         <div id="progressPanel" class="mt-3 border rounded p-3 bg-light" style="display:none;"></div>
     </div>
+
+    <?php else: ?>
+
+    <div class="text-center py-5">
+        <div class="display-1 text-danger mb-3">🚫</div>
+        <h3 class="fw-bold mb-2">Ehhez nincs jogosultságod.</h3>
+        <p class="text-muted lead mb-4">Ezt a funkciót csak az adminisztrátor használhatja.</p>
+        <a href="index.php" class="btn btn-primary">← Vissza a kezdőlapra</a>
+    </div>
+
+    <?php endif; ?>
 </div>
 
 <!-- Session warning modal -->
@@ -983,7 +1202,11 @@ function updateSessionDisplay() {
 function extendSession() {
     if (sessionExtending) return;
     sessionExtending = true;
-    fetch('session_ping.php')
+    fetch('session_ping.php', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8' },
+        body: 'action=keepalive&csrf_token=' + encodeURIComponent(CSRF_TOKEN)
+    })
     .then(r => r.json())
     .then(data => {
         if (data.remaining) {

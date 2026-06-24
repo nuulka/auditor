@@ -22,55 +22,15 @@ if (!isset($_SESSION[GC_LOGIN_COOKIE])) {
 // Load common auth helpers and user context
 require_once __DIR__ . '/lib/bootstrap.php';
 require_once __DIR__ . '/lib/auth.php';
+require_once __DIR__ . '/lib/session.php';
 // populate accessible churches for the session
 build_user_context_from_ots();
+$accessible_church_ids = get_accessible_church_ids();
 
-if (empty($_SESSION['csrf_token'])) {
-    $_SESSION['csrf_token'] = bin2hex(random_bytes(32));
-}
+$session_remaining = ensure_revizor_session_timeout();
+ensure_revizor_csrf_token();
 
-// Revizor Asszisztens session timeout — 20 perc, OTS 10 perces idejét felülírja
-define('REVIZOR_SESSION_DURATION', 1200);
-$_SESSION[GN_LAST_ACTIVE] = time();
-if (!isset($_SESSION['revizor_expires_at'])) {
-    $_SESSION['revizor_expires_at'] = time() + REVIZOR_SESSION_DURATION;
-}
-if (time() >= $_SESSION['revizor_expires_at']) {
-    session_destroy();
-    header('Location: login.php');
-    exit;
-}
-$session_remaining = $_SESSION['revizor_expires_at'] - time();
-
-// Keepalive — session hosszabbítás AJAX-ból
-if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['action'] === 'keepalive') {
-    header('Content-Type: application/json');
-    if (!isset($_POST['csrf_token']) || $_POST['csrf_token'] !== $_SESSION['csrf_token']) {
-        echo json_encode(['status' => 'ERROR']);
-        exit;
-    }
-    $_SESSION['revizor_expires_at'] = time() + REVIZOR_SESSION_DURATION;
-    $_SESSION[GN_LAST_ACTIVE] = time();
-    echo json_encode(['status' => 'OK', 'remaining' => REVIZOR_SESSION_DURATION]);
-    exit;
-}
-
-// Server-side session check AJAX
-if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['action'] === 'check_session') {
-    header('Content-Type: application/json');
-    $remaining = isset($_SESSION['revizor_expires_at']) ? $_SESSION['revizor_expires_at'] - time() : 0;
-    if ($remaining <= 0) {
-        session_destroy();
-        echo json_encode(['status' => 'EXPIRED']);
-    } else {
-        echo json_encode(['status' => 'OK', 'remaining' => $remaining]);
-    }
-    exit;
-}
-
-$conn = new mysqli('localhost', 'root', '', 'revizor_db');
-if ($conn->connect_error) { die("Database connection failed: " . $conn->connect_error); }
-$conn->set_charset("utf8mb4");
+$conn = get_revizor_conn();
 
 // Custom patterns CRUD
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['action'] === 'custom_patterns') {
@@ -95,7 +55,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['
             $stmt_cp->execute();
             $res = $stmt_cp->get_result();
         } else {
-            $res = $conn->query("SELECT id, church_id, bank_pattern, ots_pattern, label FROM custom_patterns WHERE church_id = $church_id ORDER BY id");
+            echo json_encode(['status' => 'ERROR', 'message' => 'Lekérdezési hiba']);
+            exit;
         }
         $items = [];
         while ($r = $res->fetch_assoc()) {
@@ -155,7 +116,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['
             echo json_encode(['status' => 'ERROR', 'message' => 'id required']);
             exit;
         }
-        $conn->query("DELETE FROM custom_patterns WHERE id = $id");
+        $stmt = $conn->prepare("DELETE FROM custom_patterns WHERE id = ?");
+        if ($stmt) { $stmt->bind_param('i', $id); $stmt->execute(); }
         echo json_encode(['status' => 'OK']);
         exit;
     }
@@ -210,7 +172,14 @@ $conn->query("CREATE TABLE IF NOT EXISTS bank_reconciliation (
     INDEX idx_ots_record_id (ots_record_id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4");
 
-$conn->query("ALTER TABLE bank_reconciliation MODIFY COLUMN status VARCHAR(20) DEFAULT 'UNCHECKED'");
+$col_check = $conn->query("SHOW COLUMNS FROM bank_reconciliation LIKE 'status'");
+if ($col_check) {
+    $col_def = $col_check->fetch_assoc();
+    // Only ALTER if the type is not already VARCHAR(20)
+    if ($col_def && !str_starts_with($col_def['Type'], 'varchar(20)')) {
+        $conn->query("ALTER TABLE bank_reconciliation MODIFY COLUMN status VARCHAR(20) DEFAULT 'UNCHECKED'");
+    }
+}
 
 // Segédtáblák auto-létrehozása
 $conn->query("CREATE TABLE IF NOT EXISTS church_bank_accounts (
@@ -220,6 +189,7 @@ $conn->query("CREATE TABLE IF NOT EXISTS church_bank_accounts (
     bank_account_clean VARCHAR(50) DEFAULT '',
     bank_name VARCHAR(100) DEFAULT '',
     account_type VARCHAR(20) DEFAULT 'CHECKING',
+    skip_import TINYINT(1) NOT NULL DEFAULT 0,
     UNIQUE KEY uq_church_account (church_id, bank_account),
     INDEX idx_account_clean (bank_account_clean)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4");
@@ -267,10 +237,16 @@ $conn->query("CREATE TABLE IF NOT EXISTS audit_checklist (
     decision_number_ok TINYINT(1) DEFAULT 0,
     fund_designation_ok TINYINT(1) DEFAULT 0,
     supporting_doc_ok TINYINT(1) DEFAULT 0,
+    bank_in_ots_ok TINYINT(1) DEFAULT 0,
     notes TEXT DEFAULT NULL,
     UNIQUE KEY uk_bank_rec (bank_reconciliation_id),
     FOREIGN KEY (bank_reconciliation_id) REFERENCES bank_reconciliation(id) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4");
+// ALTER for existing tables that lack the new column
+$ac_cols = $conn->query("SHOW COLUMNS FROM audit_checklist LIKE 'bank_in_ots_ok'");
+if ($ac_cols && $ac_cols->num_rows === 0) {
+    $conn->query("ALTER TABLE audit_checklist ADD COLUMN bank_in_ots_ok TINYINT(1) DEFAULT 0");
+}
 
 // OTS Kiadás típusok meghatározása (az előjel helyes számításához)
 $exp_types = [];
@@ -296,9 +272,15 @@ if (empty($exp_types_str)) { $exp_types_str = '-1'; }
 
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['action'] === 'save') {
     $id = isset($_POST['id']) ? intval($_POST['id']) : 0;
-    $status = isset($_POST['status']) ? $conn->real_escape_string(trim($_POST['status'])) : 'UNCHECKED';
-    $comment = isset($_POST['comment']) ? $conn->real_escape_string(trim($_POST['comment'])) : '';
-    $ots_doc_input = isset($_POST['ots_doc']) ? $conn->real_escape_string(trim($_POST['ots_doc'])) : '';
+    $status = isset($_POST['status']) ? trim($_POST['status']) : 'UNCHECKED';
+    $allowed_statuses = ['UNCHECKED', 'OK', 'HIANY', 'ELTERES', 'CSUSZAS', 'OSSZEVONT'];
+    if (!in_array($status, $allowed_statuses, true)) {
+        $status = 'UNCHECKED';
+    }
+    $comment = isset($_POST['comment']) ? trim($_POST['comment']) : '';
+    $ots_doc_input = isset($_POST['ots_doc']) ? trim($_POST['ots_doc']) : '';
+    $comment = mb_substr($comment, 0, 1000, 'UTF-8');
+    $ots_doc_input = mb_substr($ots_doc_input, 0, 50, 'UTF-8');
     if (!isset($_POST['csrf_token']) || $_POST['csrf_token'] !== $_SESSION['csrf_token']) {
         echo "CSRF token mismatch";
         exit;
@@ -331,7 +313,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['
                     $stmt_ots->execute();
                     $ots_res = $stmt_ots->get_result();
                 } else {
-                    $ots_res = $conn->query("SELECT DATE(MAX(DATETIME)) as ots_date, SUM(IF(T.TYPE IN ($exp_types_str), -1 * T.AMOUNT, T.AMOUNT)) as ots_amount FROM ots.TRANSACTIONS T WHERE CHURCH_ID = $c_id AND CASH_DOCUMENT_NUMBER = '$ots_doc_input' GROUP BY RECORD_ID LIMIT 1");
+                    echo "Lekérdezési hiba";
+                    exit;
                 }
 
                 if ($ots_res && $ots_res->num_rows > 0) {
@@ -367,8 +350,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['
     if (!is_admin()) {
         $allowed = get_accessible_church_ids();
         if (empty($allowed)) { echo json_encode(['status'=>'ERROR','message'=>'No accessible churches']); exit; }
-        $ids = implode(',', array_map('intval', $allowed));
-        $church_where = "AND T.CHURCH_ID IN ($ids)";
+        $allowed = array_values(array_filter(array_map('intval', $allowed), function ($v) { return $v > 0; }));
+        if (empty($allowed)) { echo json_encode(['status'=>'ERROR','message'=>'No accessible churches']); exit; }
+        $church_placeholders = implode(',', array_fill(0, count($allowed), '?'));
+        $church_where = "AND T.CHURCH_ID IN ($church_placeholders)";
     } else {
         $church_where = '';
     }
@@ -394,7 +379,13 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['
             
     $stmt = $conn->prepare($sql);
     if ($stmt) {
-        $stmt->bind_param("d", $amount);
+        if (!is_admin()) {
+            $types = str_repeat('i', count($allowed)) . 'd';
+            $params = array_merge($allowed, [$amount]);
+            $stmt->bind_param($types, ...$params);
+        } else {
+            $stmt->bind_param("d", $amount);
+        }
         $stmt->execute();
         $res = $stmt->get_result();
         $results = [];
@@ -415,21 +406,40 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['
     header('Content-Type: application/json');
     $ids = json_decode($_POST['ids'] ?? '[]', true);
     if (is_array($ids) && count($ids) > 0) {
-        $ids_str = implode(',', array_map('intval', $ids));
+        $ids = array_values(array_unique(array_filter(array_map('intval', $ids), function ($v) { return $v > 0; })));
+        if (empty($ids)) {
+            echo json_encode(['status' => 'ERROR']);
+            exit;
+        }
         $user = $_SESSION[GC_USER_FULL_NAME] ?? 'Ismeretlen';
         // Scope check: ensure all records belong to accessible churches for non-admins
         if (!is_admin()) {
-            $chk = $conn->query("SELECT DISTINCT church_id FROM bank_reconciliation WHERE id IN ($ids_str)");
+            $ids_placeholders = implode(',', array_fill(0, count($ids), '?'));
+            $chk = $conn->prepare("SELECT DISTINCT church_id FROM bank_reconciliation WHERE id IN ($ids_placeholders)");
             $allowed = get_accessible_church_ids();
-            while ($rowchk = $chk->fetch_assoc()) {
+            if (!$chk) {
+                echo json_encode(['status' => 'ERROR', 'message' => 'Lekérdezési hiba']);
+                exit;
+            }
+            $types = str_repeat('i', count($ids));
+            $chk->bind_param($types, ...$ids);
+            $chk->execute();
+            $chk_res = $chk->get_result();
+            while ($rowchk = $chk_res->fetch_assoc()) {
                 if (!in_array(intval($rowchk['church_id']), $allowed, true)) {
                     echo json_encode(['status' => 'ERROR', 'message' => 'Forbidden: some records are outside your scope']);
                     exit;
                 }
             }
         }
-        $sql = "UPDATE bank_reconciliation SET status = 'OK', updated_by = '".$conn->real_escape_string($user)."' WHERE id IN ($ids_str) AND status = 'CSUSZAS'";
-        if ($conn->query($sql)) {
+        $placeholders = implode(',', array_fill(0, count($ids), '?'));
+        $sql = "UPDATE bank_reconciliation SET status = 'OK', updated_by = ? WHERE id IN ($placeholders) AND status = 'CSUSZAS'";
+        $stmt = $conn->prepare($sql);
+        if ($stmt) {
+            $types = 's' . str_repeat('i', count($ids));
+            $params = array_merge([$user], array_map('intval', $ids));
+            $stmt->bind_param($types, ...$params);
+            $stmt->execute();
             echo json_encode(['status' => 'OK', 'count' => $conn->affected_rows]);
             exit;
         }
@@ -465,8 +475,17 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['
     // Ha progresszív, akkor 4 körben fut le. Ha egyedi, csak 1 körben az adott nappal.
     $passes = ($mode === 'progressive') ? [0, 3, 6, 12, 35, 60, 'text'] : [$custom_days];
 
-    $church_filter_sql = $all_churches ? '' : " AND church_id = $filter_church_id";
-    $unmatched = $conn->query("SELECT id, church_id, bank_date, bank_amount, bank_desc, bank_ext_name, bank_ext_ref, bank_init_acc, bank_ext_acc FROM bank_reconciliation WHERE status = 'UNCHECKED' $church_filter_sql");
+    if ($all_churches) {
+        $um_stmt = $conn->prepare("SELECT id, church_id, bank_date, bank_amount, bank_desc, bank_ext_name, bank_ext_ref, bank_init_acc, bank_ext_acc FROM bank_reconciliation WHERE status = 'UNCHECKED'");
+    } else {
+        $um_stmt = $conn->prepare("SELECT id, church_id, bank_date, bank_amount, bank_desc, bank_ext_name, bank_ext_ref, bank_init_acc, bank_ext_acc FROM bank_reconciliation WHERE status = 'UNCHECKED' AND church_id = ?");
+    }
+    $unmatched = false;
+    if ($um_stmt) {
+        if (!$all_churches) { $um_stmt->bind_param('i', $filter_church_id); }
+        $um_stmt->execute();
+        $unmatched = $um_stmt->get_result();
+    }
     $stats = ['pass_0' => 0, 'pass_3' => 0, 'pass_6' => 0, 'pass_12' => 0, 'pass_35' => 0, 'pass_60' => 0, 'pass_text' => 0, 'pass_tc' => 0, 'custom' => 0];
     $total_matched = 0;
     $total_records = $unmatched ? $unmatched->num_rows : 0;
@@ -479,6 +498,13 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['
             $provider_kws[] = $pk;
         }
     }
+
+    // progress file for frontend polling
+    $progress_file = sys_get_temp_dir() . DIRECTORY_SEPARATOR . 'revizor_progress_' . session_id() . '.json';
+    @file_put_contents($progress_file, json_encode(['status'=>'RUNNING','matched'=>0,'total_unchecked'=>$total_records,'current_church'=>null,'processed_churches'=>0,'processed_records'=>0,'time_sec'=>0]));
+    $processed_records = 0;
+    $start_time = microtime(true);
+    session_write_close(); // release session lock so match_progress.php polling can proceed
 
     // Load custom_patterns (church-specific)
     $custom_patterns_by_church = [];
@@ -497,11 +523,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['
                         tc.CASH_DOCUMENT_NUMBER AS ots_doc,
                         tc.id AS tc_id,
                         CONCAT(tc.YEAR, '. ', tc.MONTH, '. havi konferencia utalás') AS ots_desc
-                 FROM ots.transfers_to_conference tc
-                 WHERE tc.CHURCH_ID = ?
-                   AND tc.VIA_BANK = 1
-                   AND tc.AMOUNT = ?
-                   AND CONCAT(tc.YEAR, '-', LPAD(tc.MONTH, 2, '0'), '-', LPAD(tc.DAY, 2, '0')) BETWEEN ? AND ?";
+                  FROM ots.transfers_to_conference tc
+                  WHERE tc.CHURCH_ID = ?
+                    AND tc.VIA_BANK = 1
+                    AND tc.AMOUNT = ABS(?)
+                    AND CONCAT(tc.YEAR, '-', LPAD(tc.MONTH, 2, '0'), '-', LPAD(tc.DAY, 2, '0')) BETWEEN ? AND ?";
     $tc_stmt = $conn->prepare($tc_query);
 
     if ($unmatched && $unmatched->num_rows > 0) {
@@ -568,7 +594,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['
                                 $after_pattern = substr($b_text, strpos($b_text, $ta_parts[0]) + strlen($ta_parts[0]));
                                 $person_search = trim(preg_replace('/\s*(JANUÁR|FEBRUÁR|MÁRCIUS|ÁPRILIS|MÁJUS|JÚNIUS|JÚLIUS|AUGUSZTUS|SZEPTEMBER|OKTÓBER|NOVEMBER|DECEMBER)\s*$/iu', '', $after_pattern));
                                 if (!empty($person_search)) {
-                                    $like_name = '%' . $conn->real_escape_string($person_search) . '%';
+                                    $like_name = '%' . $person_search . '%';
                                     $ta_q = "SELECT T.RECORD_ID,
                                                     SUM(IF(T.TYPE IN ($exp_types_str), -1 * T.AMOUNT, T.AMOUNT)) as adj_amount,
                                                     MAX(T.DATETIME) AS ots_date,
@@ -623,7 +649,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['
                             }
                         }
                         
-                        if ($ta_matched) continue 2; // skip to next bank row
+                        if ($ta_matched) { $processed_records++; continue 2; } // skip to next bank row
                         
                         if ($ots_result && $ots_result->num_rows > 0) {
                             while ($ots_row = $ots_result->fetch_assoc()) {
@@ -786,7 +812,7 @@ $ots_query = "SELECT RECORD_ID, MAX(CASH_DOCUMENT_NUMBER) AS ots_doc, MAX(DATETI
                             // 40 napos duplikátumszűrő: ha ugyanaz az összeg + hasonló közlemény más napon is előfordul 40 napon belül
                             $is_duplicate = false;
                             if ($days === 0) {
-                                $b_desc_prefix = $conn->real_escape_string(mb_substr($b_desc, 0, 80, 'UTF-8'));
+                                $b_desc_prefix = mb_substr($b_desc, 0, 80, 'UTF-8');
                                 $dup_q = $conn->prepare("SELECT COUNT(*) as cnt FROM bank_reconciliation WHERE church_id = ? AND bank_amount = ? AND bank_date BETWEEN ? AND ? AND id != ? AND status != 'UNCHECKED' AND LEFT(bank_desc, 80) = ?");
                                 if ($dup_q) {
                                     $dup_start = date('Y-m-d', strtotime("$bank_date -40 days"));
@@ -835,7 +861,7 @@ $ots_query = "SELECT RECORD_ID, MAX(CASH_DOCUMENT_NUMBER) AS ots_doc, MAX(DATETI
                                 $comment = '[Auto: 100% egyezés, azonos hónap]';
                                 
                                 // 40 napos duplikátumszűrő itt is (közleményt is vizsgál)
-                                $b_desc_prefix = $conn->real_escape_string(mb_substr($b_desc, 0, 80, 'UTF-8'));
+                                $b_desc_prefix = mb_substr($b_desc, 0, 80, 'UTF-8');
                                 $dup_q = $conn->prepare("SELECT COUNT(*) as cnt FROM bank_reconciliation WHERE church_id = ? AND bank_amount = ? AND bank_date BETWEEN ? AND ? AND id != ? AND status != 'UNCHECKED' AND LEFT(bank_desc, 80) = ?");
                                 if ($dup_q) {
                                     $dup_start = date('Y-m-d', strtotime("$bank_date -40 days"));
@@ -911,8 +937,16 @@ $ots_query = "SELECT RECORD_ID, MAX(CASH_DOCUMENT_NUMBER) AS ots_doc, MAX(DATETI
                     }
                 }
             }
+            // update progress every record
+            $processed_records++;
+            if ($processed_records % 20 === 0 || $processed_records === $total_records) {
+                @file_put_contents($progress_file, json_encode(['status'=>'RUNNING','matched'=>$total_matched,'total_unchecked'=>$total_records,'current_church'=>null,'processed_churches'=>0,'processed_records'=>$processed_records,'time_sec'=>round(microtime(true)-$start_time,2)]));
+            }
         }
     }
+    $elapsed = round(microtime(true) - $start_time, 2);
+    @file_put_contents($progress_file, json_encode(['status'=>'DONE','matched'=>$total_matched,'total_unchecked'=>$total_records,'current_church'=>null,'processed_churches'=>0,'processed_records'=>$processed_records,'time_sec'=>$elapsed]));
+    register_shutdown_function(function() use ($progress_file){ if (file_exists($progress_file)) @unlink($progress_file); });
     echo json_encode(['status' => 'OK', 'matched' => $total_matched, 'total' => $total_records, 'details' => $stats]);
     exit;
 }
@@ -925,13 +959,16 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['
         exit;
     }
     $church_id = isset($_POST['church_id']) ? intval($_POST['church_id']) : 0;
-    $ots_doc = isset($_POST['ots_doc']) ? $conn->real_escape_string(trim($_POST['ots_doc'])) : '';
-    $church_name = isset($_POST['church_name']) ? $conn->real_escape_string(trim($_POST['church_name'])) : '';
-    $bank_date = isset($_POST['bank_date']) ? $conn->real_escape_string(trim($_POST['bank_date'])) : '';
+    $ots_doc = isset($_POST['ots_doc']) ? mb_substr(trim($_POST['ots_doc']), 0, 50, 'UTF-8') : '';
+    $church_name = isset($_POST['church_name']) ? mb_substr(trim($_POST['church_name']), 0, 100, 'UTF-8') : '';
+    $bank_date = isset($_POST['bank_date']) ? trim($_POST['bank_date']) : '';
+    $bank_date_dt = DateTime::createFromFormat('Y-m-d', $bank_date);
+    $bank_date = ($bank_date_dt instanceof DateTime && $bank_date_dt->format('Y-m-d') === $bank_date) ? $bank_date : '';
     $bank_amount = isset($_POST['bank_amount']) ? floatval($_POST['bank_amount']) : 0;
     $bank_desc = isset($_POST['bank_desc']) ? trim($_POST['bank_desc']) : '';
     $bank_ext_name = isset($_POST['bank_ext_name']) ? trim($_POST['bank_ext_name']) : '';
     $unmatched_search = isset($_POST['unmatched_search']) && $_POST['unmatched_search'] === '1';
+    $bank_rec_id = isset($_POST['id']) ? intval($_POST['id']) : 0;
 
     if ($church_id <= 0) {
         echo json_encode(['status' => 'ERROR', 'message' => 'Hiányzó paraméterek']);
@@ -940,6 +977,82 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['
 
     // require access to this church
     require_church_access($church_id);
+
+    // Ha a banki tételnek már van meglévő párosítása, azt adjuk vissza
+    if (!$unmatched_search && $bank_rec_id > 0) {
+        $existing = [];
+        // Több tételes párosítás (bank_reconciliation_items) — elsőbbséget élvez
+        $stmt_multi = $conn->prepare("SELECT record_id, amount FROM bank_reconciliation_items WHERE reconciliation_id = ?");
+        if ($stmt_multi) {
+            $stmt_multi->bind_param('i', $bank_rec_id);
+            $stmt_multi->execute();
+            $multi_res = $stmt_multi->get_result();
+            while ($m = $multi_res->fetch_assoc()) {
+                $existing[] = $m;
+            }
+        }
+        // Egyedi párosítás (bank_reconciliation.ots_record_id) — csak ha nincs items
+        if (empty($existing)) {
+            $stmt_ex = $conn->prepare("SELECT ots_record_id, ots_date, ots_amount, ots_doc FROM bank_reconciliation WHERE id = ? AND ots_record_id IS NOT NULL AND ots_record_id > 0");
+            if ($stmt_ex) {
+                $stmt_ex->bind_param('i', $bank_rec_id);
+                $stmt_ex->execute();
+                $ex_res = $stmt_ex->get_result();
+                if ($ex_res && $ex_res->num_rows > 0) {
+                    $ex_row = $ex_res->fetch_assoc();
+                    $existing[] = $ex_row;
+                }
+            }
+        }
+        if (!empty($existing)) {
+            // OTS adatok lekérése a meglévő párosításokhoz
+            $record_ids = [];
+            foreach ($existing as $ex) {
+                $rid = $ex['ots_record_id'] ?? $ex['record_id'] ?? 0;
+                if ($rid > 0) $record_ids[] = $rid;
+            }
+            if (!empty($record_ids)) {
+                $id_list = implode(',', array_fill(0, count($record_ids), '?'));
+                $adjusted_amount_sql = "IF(T.TYPE IN ($exp_types_str), -1 * T.AMOUNT, T.AMOUNT)";
+                $base_joins = "FROM ots.TRANSACTIONS T
+                         LEFT JOIN ots.PERSONS p ON T.PERSON_ID = p.id
+                         LEFT JOIN ots.NAMES_OF_TRANSACTION nt1 ON T.NAME_ID = nt1.id
+                         LEFT JOIN ots.NAMES_OF_TRANSACTION nt2 ON T.NAME2_ID = nt2.id
+                         LEFT JOIN ots.TRANSACTION_TYPE tt ON T.TYPE = tt.id
+                         LEFT JOIN ots.USERS u ON T.EDITED_BY = u.id
+                         LEFT JOIN ots.funds funds ON T.FUND_ID = funds.id";
+                $sql_ex = "SELECT T.*,
+                       $adjusted_amount_sql AS adjusted_amount,
+                       TRIM(CONCAT(
+                           IFNULL(CONCAT_WS(' ', p.NAME_PREFIX, p.NAME, p.NAME_SUFFIX), ''),
+                           ' ', IFNULL(nt1.NAME, ''), ' ', IFNULL(nt2.NAME, '')
+                       )) AS ots_desc_full,
+                       tt.NAME AS ots_type_name,
+                       u.NAME AS ots_editor_name,
+                       funds.NAME AS fund_name
+                 $base_joins
+                  WHERE T.RECORD_ID IN ($id_list)
+                  ORDER BY T.DATETIME ASC";
+                $stmt_ex = $conn->prepare($sql_ex);
+                $result_ex = false;
+                if ($stmt_ex) {
+                    $types = str_repeat('i', count($record_ids));
+                    $stmt_ex->bind_param($types, ...$record_ids);
+                    $stmt_ex->execute();
+                    $result_ex = $stmt_ex->get_result();
+                }
+                $ex_rows = [];
+                if ($result_ex) {
+                    while ($r = $result_ex->fetch_assoc()) {
+                        $r['_text_score'] = 0;
+                        $ex_rows[] = $r;
+                    }
+                }
+                echo json_encode(['status' => 'OK', 'data' => $ex_rows, 'church_name' => $church_name, 'ots_doc' => $ots_doc, 'bank_date' => $bank_date, 'bank_amount' => $bank_amount, 'unmatched_search' => false, 'from_existing' => true]);
+                exit;
+            }
+        }
+    }
 
     $adjusted_amount_sql = "IF(T.TYPE IN ($exp_types_str), -1 * T.AMOUNT, T.AMOUNT)";
 
@@ -971,16 +1084,23 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['
                        u.NAME AS ots_editor_name,
                        funds.NAME AS fund_name
                  $base_joins
-                 WHERE T.CHURCH_ID = $church_id
-                   AND T.DATETIME BETWEEN '$start_date' AND '$end_date'
-                   AND T.RECORD_ID NOT IN (
-                       SELECT ots_record_id FROM bank_reconciliation WHERE ots_record_id IS NOT NULL AND church_id = $church_id
+                  WHERE T.CHURCH_ID = ?
+                    AND T.DATETIME BETWEEN ? AND ?
+                    AND T.DATETIME >= DATE_SUB(?, INTERVAL 45 DAY)
+                    AND T.RECORD_ID NOT IN (
+                       SELECT ots_record_id FROM bank_reconciliation WHERE ots_record_id IS NOT NULL AND church_id = ?
                        UNION
                        SELECT record_id FROM bank_reconciliation_items
                    )
                  GROUP BY T.RECORD_ID
                  HAVING adjusted_amount $sign 0
-                 ORDER BY ABS(DATEDIFF(T.DATETIME, '$bank_date')) ASC, T.DATETIME ASC";
+                 ORDER BY ABS(DATEDIFF(T.DATETIME, ?)) ASC, T.DATETIME ASC";
+        $stmt = $conn->prepare($sql);
+        if ($stmt) {
+            $stmt->bind_param('isssis', $church_id, $start_date, $end_date, $bank_date, $church_id, $bank_date);
+            $stmt->execute();
+            $result = $stmt->get_result();
+        }
     } else {
         if (empty($bank_amount)) {
             echo json_encode(['status' => 'ERROR', 'message' => 'Hiányzó összeg']);
@@ -990,22 +1110,23 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['
         if (!empty($bank_date)) {
             $start_date = date('Y-m-d', strtotime("$bank_date -60 days"));
             $end_date = date('Y-m-d', strtotime("$bank_date +60 days"));
-            $date_filter = "AND T.DATETIME BETWEEN '$start_date' AND '$end_date'";
+            $date_filter = "AND T2.DATETIME BETWEEN ? AND ? AND T2.DATETIME >= DATE_SUB(?, INTERVAL 45 DAY)";
         }
 
         // Ugyanazzal a logikával keresünk, mint az auto-match: RECORD_ID-csoportok SUM-ja egyezik a banki összeggel
-        $record_ids_sql = "SELECT T.RECORD_ID
-                 FROM ots.TRANSACTIONS T
-                 WHERE T.CHURCH_ID = $church_id
-                 AND $adjusted_amount_sql $sign 0
+        $adjusted_amount_sql_inner = str_replace('T.', 'T2.', $adjusted_amount_sql);
+        $record_ids_sql = "SELECT T2.RECORD_ID
+                 FROM ots.TRANSACTIONS T2
+                 WHERE T2.CHURCH_ID = ?
+                 AND $adjusted_amount_sql_inner $sign 0
                  $date_filter
-                 GROUP BY T.RECORD_ID
-                 HAVING ABS(SUM($adjusted_amount_sql) - $bank_amount) < 0.01";
+                 GROUP BY T2.RECORD_ID
+                 HAVING ABS(SUM($adjusted_amount_sql_inner) - ?) < 0.01";
 
         $order_sql = "ORDER BY T.DATETIME ASC";
         if (!empty($bank_date)) {
             $order_sql = "ORDER BY 
-                ABS(DATEDIFF(T.DATETIME, '$bank_date')) ASC,
+                ABS(DATEDIFF(T.DATETIME, ?)) ASC,
                 T.DATETIME ASC";
         }
 
@@ -1024,9 +1145,28 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['
                  $base_joins
                  WHERE T.RECORD_ID IN ($record_ids_sql)
                  $order_sql";
+        $stmt = $conn->prepare($sql);
+        if ($stmt) {
+            $record_params = [$church_id];
+            $record_types = 'i';
+            if (!empty($bank_date)) {
+                $record_params[] = $start_date;
+                $record_params[] = $end_date;
+                $record_params[] = $bank_date;
+                $record_types .= 'sss';
+            }
+            $record_params[] = $bank_amount;
+            $record_types .= 'd';
+            if (!empty($bank_date)) {
+                $record_params[] = $bank_date;
+                $record_types .= 's';
+            }
+            $stmt->bind_param($record_types, ...$record_params);
+            $stmt->execute();
+            $result = $stmt->get_result();
+        }
     }
 
-    $result = $conn->query($sql);
     $rows = [];
     $bank_text = mb_strtoupper($bank_desc . ' ' . $bank_ext_name, 'UTF-8');
     $b_words = [];
@@ -1074,7 +1214,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['
     $church_id = isset($_POST['church_id']) ? intval($_POST['church_id']) : 0;
     $bank_desc = isset($_POST['bank_desc']) ? trim($_POST['bank_desc']) : '';
     $bank_ext_name = isset($_POST['bank_ext_name']) ? trim($_POST['bank_ext_name']) : '';
-    $bank_date = isset($_POST['bank_date']) ? $conn->real_escape_string(trim($_POST['bank_date'])) : '';
+    $bank_date = isset($_POST['bank_date']) ? trim($_POST['bank_date']) : '';
+    $bank_date_dt = DateTime::createFromFormat('Y-m-d', $bank_date);
+    $bank_date = ($bank_date_dt instanceof DateTime && $bank_date_dt->format('Y-m-d') === $bank_date) ? $bank_date : '';
     $bank_amount = isset($_POST['bank_amount']) ? floatval($_POST['bank_amount']) : 0;
 
     if ($church_id <= 0 || (empty($bank_desc) && empty($bank_ext_name))) {
@@ -1092,7 +1234,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['
     foreach ($words as $w) {
         $w = trim($w);
         if (mb_strlen($w, 'UTF-8') >= 3) {
-            $keywords[] = $conn->real_escape_string($w);
+            $keywords[] = $w;
         }
     }
     if (empty($keywords)) {
@@ -1101,11 +1243,18 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['
     }
 
     $sign = $bank_amount >= 0 ? '>=' : '<';
+    $result = false;
 
     // LIKE feltételek építése — bármelyik kulcsszó előfordul a leírásban
     $like_parts = [];
+    $like_params = [];
+    $like_types = '';
     foreach ($keywords as $kw) {
-        $like_parts[] = "(p.NAME LIKE '%$kw%' OR p.NAME_PREFIX LIKE '%$kw%' OR p.NAME_SUFFIX LIKE '%$kw%' OR nt1.NAME LIKE '%$kw%' OR nt2.NAME LIKE '%$kw%' OR funds.NAME LIKE '%$kw%')";
+        $like_parts[] = "(p.NAME LIKE ? OR p.NAME_PREFIX LIKE ? OR p.NAME_SUFFIX LIKE ? OR nt1.NAME LIKE ? OR nt2.NAME LIKE ? OR funds.NAME LIKE ?)";
+        for ($i = 0; $i < 6; $i++) {
+            $like_params[] = "%$kw%";
+            $like_types .= 's';
+        }
     }
     $like_where = '(' . implode(' OR ', $like_parts) . ')';
 
@@ -1125,30 +1274,39 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['
              LEFT JOIN ots.churches c ON T.CHURCH_ID = c.id";
 
     $sql = "SELECT T.*,
-                   $adjusted_amount_sql AS adjusted_amount,
-                   TRIM(CONCAT(
-                       IFNULL(CONCAT_WS(' ', p.NAME_PREFIX, p.NAME, p.NAME_SUFFIX), ''),
-                       ' ', IFNULL(nt1.NAME, ''), ' ', IFNULL(nt2.NAME, '')
+                    $adjusted_amount_sql AS adjusted_amount,
+                    TRIM(CONCAT(
+                        IFNULL(CONCAT_WS(' ', p.NAME_PREFIX, p.NAME, p.NAME_SUFFIX), ''),
+                        ' ', IFNULL(nt1.NAME, ''), ' ', IFNULL(nt2.NAME, '')
                    )) AS ots_desc_full,
                    tt.NAME AS ots_type_name,
                    u.NAME AS ots_editor_name,
                    funds.NAME AS fund_name,
-                   c.name AS church_name
-              $base_joins
-              WHERE T.CHURCH_ID = $church_id
-                AND T.DATETIME BETWEEN '$start_date' AND '$end_date'
-                AND T.RECORD_ID NOT IN (
-                    SELECT ots_record_id FROM bank_reconciliation WHERE ots_record_id IS NOT NULL AND church_id = $church_id
-                    UNION
-                    SELECT record_id FROM bank_reconciliation_items
-                )
-                AND $like_where
-              GROUP BY T.RECORD_ID
-              HAVING $adjusted_amount_sql $sign 0
-              ORDER BY T.DATETIME DESC
-              LIMIT 100";
+               c.name AS church_name
+               $base_joins
+               WHERE T.CHURCH_ID = ?
+                 AND T.DATETIME BETWEEN ? AND ?
+                 AND T.RECORD_ID NOT IN (
+                     SELECT ots_record_id FROM bank_reconciliation WHERE ots_record_id IS NOT NULL AND church_id = ?
+                     UNION
+                     SELECT record_id FROM bank_reconciliation_items
+                 )
+                 AND $like_where
+               GROUP BY T.RECORD_ID
+               HAVING $adjusted_amount_sql $sign 0
+               ORDER BY T.DATETIME DESC
+               LIMIT 100";
 
-    $result = $conn->query($sql);
+    $stmt = $conn->prepare($sql);
+    if ($stmt) {
+        $bind_types = 'iiss' . $like_types;
+        $bind_values = array_merge([$church_id, $church_id, $start_date, $end_date], $like_params);
+        $stmt->bind_param($bind_types, ...$bind_values);
+        $stmt->execute();
+        $result = $stmt->get_result();
+    } else {
+        $result = false;
+    }
     $rows = [];
     if ($result) {
         while ($r = $result->fetch_assoc()) {
@@ -1194,20 +1352,29 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['
 
     $start_date = !empty($ots_date) ? date('Y-m-d', strtotime("$ots_date -90 days")) : '1970-01-01';
     $end_date = !empty($ots_date) ? date('Y-m-d', strtotime("$ots_date +90 days")) : date('Y-m-d', strtotime('+90 days'));
+    $neg_amount = -1 * abs($ots_amount);
+    $pos_amount = abs($ots_amount);
 
     $sql = "SELECT id, bank_date, bank_amount, bank_desc, bank_ext_name, bank_init_name, 
                    bank_init_acc, bank_ben_name, bank_ben_acc, bank_ext_ref, comment
             FROM bank_reconciliation 
-            WHERE church_id = $church_id 
+            WHERE church_id = ? 
               AND status = 'UNCHECKED'
-              AND bank_date BETWEEN '$start_date' AND '$end_date'
+              AND bank_date BETWEEN ? AND ?
             ORDER BY 
-              CASE WHEN bank_amount = " . (-1 * abs($ots_amount)) . " OR bank_amount = " . abs($ots_amount) . " THEN 0 ELSE 1 END,
-              ABS(bank_amount - " . abs($ots_amount) . ") ASC,
-              ABS(DATEDIFF(bank_date, '$ots_date')) ASC
+              CASE WHEN bank_amount = ? OR bank_amount = ? THEN 0 ELSE 1 END,
+              ABS(bank_amount - ?) ASC,
+              ABS(DATEDIFF(bank_date, ?)) ASC
             LIMIT 50";
 
-    $result = $conn->query($sql);
+    $stmt = $conn->prepare($sql);
+    if ($stmt) {
+        $stmt->bind_param('issddds', $church_id, $start_date, $end_date, $neg_amount, $pos_amount, $pos_amount, $ots_date);
+        $stmt->execute();
+        $result = $stmt->get_result();
+    } else {
+        $result = false;
+    }
     $rows = [];
     if ($result) {
         while ($r = $result->fetch_assoc()) {
@@ -1228,7 +1395,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['
     }
     $ots_record_id = isset($_POST['ots_record_id']) ? intval($_POST['ots_record_id']) : 0;
     $ots_amount = isset($_POST['ots_amount']) ? floatval($_POST['ots_amount']) : 0;
-    $ots_date = isset($_POST['ots_date']) ? $conn->real_escape_string(trim($_POST['ots_date'])) : '';
+    $ots_date = isset($_POST['ots_date']) ? trim($_POST['ots_date']) : '';
+    $ots_date_dt = DateTime::createFromFormat('Y-m-d', $ots_date);
+    $ots_date = ($ots_date_dt instanceof DateTime && $ots_date_dt->format('Y-m-d') === $ots_date) ? $ots_date : '';
     $church_id = isset($_POST['church_id']) ? intval($_POST['church_id']) : 0;
     $bank_ids = isset($_POST['bank_ids']) ? json_decode($_POST['bank_ids'], true) : [];
 
@@ -1241,14 +1410,19 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['
     require_church_access($church_id);
 
     // OTS adatok lekérése az összeg pontosításhoz
-    $ots_check = $conn->query("SELECT adjusted_amount FROM (
+    $ots_check = $conn->prepare("SELECT adjusted_amount FROM (
         SELECT SUM(IF(T.TYPE IN ($exp_types_str), -1 * T.AMOUNT, T.AMOUNT)) AS adjusted_amount
-        FROM ots.TRANSACTIONS T WHERE T.RECORD_ID = $ots_record_id AND T.CHURCH_ID = $church_id
+        FROM ots.TRANSACTIONS T WHERE T.RECORD_ID = ? AND T.CHURCH_ID = ?
     ) sub");
     $actual_ots_amount = $ots_amount;
-    if ($ots_check && $ots_check->num_rows > 0) {
-        $row = $ots_check->fetch_assoc();
-        $actual_ots_amount = $row['adjusted_amount'];
+    if ($ots_check) {
+        $ots_check->bind_param('ii', $ots_record_id, $church_id);
+        $ots_check->execute();
+        $ots_check_res = $ots_check->get_result();
+        if ($ots_check_res && $ots_check_res->num_rows > 0) {
+            $row = $ots_check_res->fetch_assoc();
+            $actual_ots_amount = $row['adjusted_amount'];
+        }
     }
 
     $user = $_SESSION[GC_USER_FULL_NAME] ?? 'Ismeretlen';
@@ -1263,7 +1437,14 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['
         $ots_date_only = !empty($ots_date) ? substr($ots_date, 0, 10) : null;
 
         // Ha az összeg egyezik, OK státusz
-        $bank_row = $conn->query("SELECT bank_amount FROM bank_reconciliation WHERE id = $bank_id AND church_id = $church_id");
+        $bank_row_stmt = $conn->prepare("SELECT bank_amount FROM bank_reconciliation WHERE id = ? AND church_id = ?");
+        if ($bank_row_stmt) {
+            $bank_row_stmt->bind_param('ii', $bank_id, $church_id);
+            $bank_row_stmt->execute();
+            $bank_row = $bank_row_stmt->get_result();
+        } else {
+            $bank_row = false;
+        }
         if ($bank_row && $bank_row->num_rows > 0) {
             $b = $bank_row->fetch_assoc();
             if (!empty($ots_date_only) && abs($b['bank_amount'] - $actual_ots_amount) < 0.01) {
@@ -1272,16 +1453,22 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['
             }
         }
 
-        $sql = "UPDATE bank_reconciliation SET 
-                    ots_record_id = $ots_record_id,
-                    ots_amount = $actual_ots_amount,
-                    ots_date = " . ($ots_date_only ? "'$ots_date_only'" : "NULL") . ",
-                    ots_doc = (SELECT CASH_DOCUMENT_NUMBER FROM ots.TRANSACTIONS WHERE RECORD_ID = $ots_record_id LIMIT 1),
-                    status = '$status',
-                    comment = '$comment',
-                    updated_by = '$user'
-                WHERE id = $bank_id AND church_id = $church_id";
-        if ($conn->query($sql)) {
+        $doc_stmt = $conn->prepare("SELECT CASH_DOCUMENT_NUMBER FROM ots.TRANSACTIONS WHERE RECORD_ID = ? LIMIT 1");
+        $doc_value = '';
+        if ($doc_stmt) {
+            $doc_stmt->bind_param('i', $ots_record_id);
+            $doc_stmt->execute();
+            $doc_res = $doc_stmt->get_result();
+            if ($doc_res && ($doc_row = $doc_res->fetch_assoc())) {
+                $doc_value = $doc_row['CASH_DOCUMENT_NUMBER'] ?? '';
+            }
+        }
+        $sql = "UPDATE bank_reconciliation SET ots_record_id = ?, ots_amount = ?, ots_date = ?, ots_doc = ?, status = ?, comment = ?, updated_by = ? WHERE id = ? AND church_id = ?";
+        $upd_stmt = $conn->prepare($sql);
+        if ($upd_stmt) {
+            $ots_date_final = $ots_date_only ?: null;
+            $upd_stmt->bind_param('idsssssii', $ots_record_id, $actual_ots_amount, $ots_date_final, $doc_value, $status, $comment, $user, $bank_id, $church_id);
+            $upd_stmt->execute();
             $success_count++;
         }
     }
@@ -1302,7 +1489,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['
         exit;
     }
     $id = isset($_POST['id']) ? intval($_POST['id']) : 0;
-    $bank_date = isset($_POST['bank_date']) ? $conn->real_escape_string(trim($_POST['bank_date'])) : '';
+    $bank_date = isset($_POST['bank_date']) ? trim($_POST['bank_date']) : '';
+    $bank_date_dt = DateTime::createFromFormat('Y-m-d', $bank_date);
+    $bank_date = ($bank_date_dt instanceof DateTime && $bank_date_dt->format('Y-m-d') === $bank_date) ? $bank_date : '';
     $bank_amount = isset($_POST['bank_amount']) ? floatval($_POST['bank_amount']) : 0;
     $mode = isset($_POST['mode']) ? $_POST['mode'] : 'single';
 
@@ -1335,8 +1524,16 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['
             exit;
         }
 
-        $rid_list = implode(',', $record_ids);
-        $items_res = $conn->query("SELECT RECORD_ID, AMOUNT, TYPE, DATETIME FROM ots.TRANSACTIONS WHERE RECORD_ID IN ($rid_list)");
+        $rid_list = implode(',', array_fill(0, count($record_ids), '?'));
+        $items_stmt = $conn->prepare("SELECT RECORD_ID, AMOUNT, TYPE, DATETIME, CASH_DOCUMENT_NUMBER FROM ots.TRANSACTIONS WHERE RECORD_ID IN ($rid_list)");
+        if ($items_stmt) {
+            $types = str_repeat('i', count($record_ids));
+            $items_stmt->bind_param($types, ...$record_ids);
+            $items_stmt->execute();
+            $items_res = $items_stmt->get_result();
+        } else {
+            $items_res = false;
+        }
         $total_ots_amount = 0;
         $dates = [];
         $item_data = [];
@@ -1379,8 +1576,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['
         }
     } else {
         // --- EGY OTS TÉTEL PÁROSÍTÁSA (eredeti működés) ---
-        $ots_doc = isset($_POST['ots_doc']) ? $conn->real_escape_string(trim($_POST['ots_doc'])) : '';
-        $ots_date = isset($_POST['ots_date']) ? $conn->real_escape_string(trim($_POST['ots_date'])) : '';
+        $ots_doc = isset($_POST['ots_doc']) ? mb_substr(trim($_POST['ots_doc']), 0, 50, 'UTF-8') : '';
+        $ots_date = isset($_POST['ots_date']) ? trim($_POST['ots_date']) : '';
+        $ots_date_dt = DateTime::createFromFormat('Y-m-d', $ots_date);
+        $ots_date = ($ots_date_dt instanceof DateTime && $ots_date_dt->format('Y-m-d') === $ots_date) ? $ots_date : '';
         $ots_amount = isset($_POST['ots_amount']) ? floatval($_POST['ots_amount']) : 0;
 
         if (empty($ots_doc)) {
@@ -1417,22 +1616,34 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['
             }
         }
         if ($record_id > 0) {
-            $adj_single = 0;
-            $stmt_ra = $conn->prepare("SELECT AMOUNT, TYPE FROM ots.TRANSACTIONS WHERE RECORD_ID = ? LIMIT 1");
-            if ($stmt_ra) {
-                $stmt_ra->bind_param('i', $record_id);
-                $stmt_ra->execute();
-                $rid_amt = $stmt_ra->get_result();
-                if ($rid_amt && $rid_amt->num_rows > 0) {
-                    $ra = $rid_amt->fetch_assoc();
-                    $adj_single = in_array($ra['TYPE'], $exp_types) ? -1 * $ra['AMOUNT'] : $ra['AMOUNT'];
+            // Insert individual OTS items (handles TYPE=1 multi-item record_ids)
+            $church_id_item = intval($row['church_id']);
+            $its_sql = "SELECT id, AMOUNT, TYPE, CASH_DOCUMENT_NUMBER, DATETIME FROM ots.TRANSACTIONS WHERE RECORD_ID = ? AND CHURCH_ID = ? ORDER BY id";
+            $its_st = $conn->prepare($its_sql);
+            $item_dates = [];
+            $item_docs = [];
+            if ($its_st) {
+                $its_st->bind_param("ii", $record_id, $church_id_item);
+                $its_st->execute();
+                $its_res = $its_st->get_result();
+                $stmt_item = $conn->prepare("INSERT INTO bank_reconciliation_items (reconciliation_id, record_id, amount) VALUES (?, ?, ?)");
+                if ($stmt_item) {
+                    while ($it = $its_res->fetch_assoc()) {
+                        $adj = in_array((int)$it['TYPE'], $exp_types) ? -1.0 * (float)$it['AMOUNT'] : (float)$it['AMOUNT'];
+                        $stmt_item->bind_param("iid", $id, $record_id, $adj);
+                        $stmt_item->execute();
+                        $item_dates[] = $it['DATETIME'];
+                        if (!empty($it['CASH_DOCUMENT_NUMBER']) && $it['CASH_DOCUMENT_NUMBER'] !== '0000') {
+                            $item_docs[] = $it['CASH_DOCUMENT_NUMBER'];
+                        }
+                    }
                 }
             }
-            $stmt_item = $conn->prepare("INSERT INTO bank_reconciliation_items (reconciliation_id, record_id, amount) VALUES (?, ?, ?)");
-            if ($stmt_item) {
-                $stmt_item->bind_param("iid", $id, $record_id, $adj_single);
-                $stmt_item->execute();
-            }
+            // update ots_date / ots_doc from individual items
+            $earliest_date = !empty($item_dates) ? substr(min($item_dates), 0, 10) : $ots_date_only;
+            $doc_list = !empty($item_docs) ? implode(', ', array_unique($item_docs)) : ((string)$record_id);
+            if ($earliest_date !== null) $ots_date_only = $earliest_date;
+            if (!empty($doc_list)) $ots_doc = $doc_list;
         }
 
         $upd = $conn->prepare("UPDATE bank_reconciliation SET ots_date=?, ots_doc=?, ots_record_id=?, ots_amount=?, status=?, comment=? WHERE id=?");
@@ -1470,7 +1681,31 @@ $mapped_ids_str = !empty($mapped_ids) ? implode(',', $mapped_ids) : "0";
 // Gyülekezeti lista és szűrési paraméterek meghatározása
 $churches = [];
 $church_names_map = [];
-$churches_query = $conn->query("SELECT id, name FROM ots.churches WHERE id IN ($mapped_ids_str) AND name IS NOT NULL AND name != '' AND id IN (SELECT DISTINCT church_id FROM bank_reconciliation) ORDER BY name ASC");
+$church_filter_ids_array = [];
+if (is_admin()) {
+    $church_filter_ids = $mapped_ids_str;
+    $church_filter_ids_array = $mapped_ids;
+} elseif (empty($accessible_church_ids)) {
+    $church_filter_ids = '0';
+} else {
+    $church_filter_ids_array = array_values(array_intersect(array_map('intval', $mapped_ids), array_map('intval', $accessible_church_ids)));
+    $church_filter_ids = implode(',', $church_filter_ids_array);
+    if ($church_filter_ids === '') {
+        $church_filter_ids = '0';
+    }
+}
+$churches_query = false;
+if (!empty($church_filter_ids_array)) {
+    $church_placeholders = implode(',', array_fill(0, count($church_filter_ids_array), '?'));
+    $churches_sql = "SELECT id, name FROM ots.churches WHERE id IN ($church_placeholders) AND name IS NOT NULL AND name != '' AND id IN (SELECT DISTINCT church_id FROM bank_reconciliation) ORDER BY name ASC";
+    $churches_stmt = $conn->prepare($churches_sql);
+    if ($churches_stmt) {
+        $church_types = str_repeat('i', count($church_filter_ids_array));
+        $churches_stmt->bind_param($church_types, ...$church_filter_ids_array);
+        $churches_stmt->execute();
+        $churches_query = $churches_stmt->get_result();
+    }
+}
 if ($churches_query) {
     while ($c_row = $churches_query->fetch_assoc()) {
         $churches[] = $c_row['name'];
@@ -1481,16 +1716,55 @@ if ($churches_query) {
     }
 }
 
-$where_sql = ($selected_church_id !== -1) ? " WHERE b.church_id = $selected_church_id " : " WHERE b.church_id IN ($mapped_ids_str) ";
+$where_parts = [];
+$where_params = [];
+$where_types = '';
+if ($selected_church_id !== -1) {
+    $where_parts[] = 'b.church_id = ?';
+    $where_params[] = $selected_church_id;
+    $where_types .= 'i';
+} elseif (is_admin()) {
+    if (empty($mapped_ids)) {
+        $where_parts[] = '1=0';
+    } else {
+        $mapped_placeholders = implode(',', array_fill(0, count($mapped_ids), '?'));
+        $where_parts[] = "b.church_id IN ($mapped_placeholders)";
+        foreach ($mapped_ids as $mid) {
+            $where_params[] = $mid;
+            $where_types .= 'i';
+        }
+    }
+} elseif (empty($church_filter_ids_array)) {
+    $where_parts[] = '1=0';
+} else {
+    $filter_placeholders = implode(',', array_fill(0, count($church_filter_ids_array), '?'));
+    $where_parts[] = "b.church_id IN ($filter_placeholders)";
+    foreach ($church_filter_ids_array as $fid) {
+        $where_params[] = $fid;
+        $where_types .= 'i';
+    }
+}
+$where_sql = $where_parts ? ' WHERE ' . implode(' AND ', $where_parts) : '';
 $url_params = !empty($selected_church_name) ? "church_filter=" . urlencode($selected_church_name) : "";
 
 // Teljes rekordszám lekérése a lapozáshoz
-$count_res = $conn->query("SELECT COUNT(*) as cnt FROM bank_reconciliation b $where_sql");
+$count_sql = "SELECT COUNT(*) as cnt FROM bank_reconciliation b $where_sql";
+$count_res = false;
+if (!empty($where_params)) {
+    $count_stmt = $conn->prepare($count_sql);
+    if ($count_stmt) {
+        $count_stmt->bind_param($where_types, ...$where_params);
+        $count_stmt->execute();
+        $count_res = $count_stmt->get_result();
+    }
+} else {
+    $count_res = $conn->query($count_sql);
+}
 $total_db_rows = ($count_res) ? $count_res->fetch_assoc()['cnt'] : 0;
 $total_pages = $limit > 0 ? ceil($total_db_rows / $limit) : 1;
 
 // A főtáblát kiegészítjük az OTS rendszer valós idejű adataival — kétlépéses lekérdezés a gyorsaságért
-$bank_query = $conn->query("SELECT 
+$bank_sql = "SELECT 
                                 b.*, 
                                 c.name AS church_name,
                                 items.item_count,
@@ -1504,8 +1778,26 @@ $bank_query = $conn->query("SELECT
                                 GROUP BY reconciliation_id
                             ) items ON b.id = items.reconciliation_id
                             $where_sql
-                            ORDER BY b.bank_date ASC
-                            LIMIT $limit OFFSET $offset");
+                            ORDER BY b.bank_date ASC";
+$bank_sql .= " LIMIT ? OFFSET ?";
+$bank_query = false;
+if (!empty($where_params)) {
+    $bank_stmt = $conn->prepare($bank_sql);
+    if ($bank_stmt) {
+        $bank_params = array_merge($where_params, [$limit, $offset]);
+        $bank_types = $where_types . 'ii';
+        $bank_stmt->bind_param($bank_types, ...$bank_params);
+        $bank_stmt->execute();
+        $bank_query = $bank_stmt->get_result();
+    }
+} else {
+    $bank_stmt = $conn->prepare($bank_sql);
+    if ($bank_stmt) {
+        $bank_stmt->bind_param('ii', $limit, $offset);
+        $bank_stmt->execute();
+        $bank_query = $bank_stmt->get_result();
+    }
+}
 $rows = [];
 if ($bank_query) {
     while ($row = $bank_query->fetch_assoc()) {
@@ -1516,17 +1808,47 @@ $total_rows = count($rows);
 
 // OTS adatok külön lekérdezése azokhoz a sorokhoz, ahol van ots_record_id
 $ots_ids = [];
+$tc_ots_ids = []; // sorindex => record_id lista TC párosításhoz
 foreach ($rows as $idx => $row) {
     $rid = $row['ots_record_id'] ?? null;
     if (!empty($rid) && $rid > 0) {
         $ots_ids[(int)$rid] = $idx;
     }
+    // TC párosított sorok: nincs ots_record_id, de van bank_reconciliation_items
+    if (empty($rid) && !empty($row['item_count']) && $row['item_count'] > 0) {
+        $tc_ots_ids[$idx] = [];
+    }
+}
+
+// TC items lekérése
+if (!empty($tc_ots_ids)) {
+    $tc_ids = array_keys($tc_ots_ids);
+    $tc_placeholders = implode(',', array_fill(0, count($tc_ids), '?'));
+    $tc_items_sql = "SELECT reconciliation_id, record_id, amount FROM bank_reconciliation_items WHERE reconciliation_id IN ($tc_placeholders) ORDER BY id";
+    $tc_items_stmt = $conn->prepare($tc_items_sql);
+    $tc_items_res = false;
+    if ($tc_items_stmt) {
+        $tc_types = str_repeat('i', count($tc_ids));
+        $tc_items_stmt->bind_param($tc_types, ...$tc_ids);
+        $tc_items_stmt->execute();
+        $tc_items_res = $tc_items_stmt->get_result();
+    }
+    if ($tc_items_res) {
+        while ($tc = $tc_items_res->fetch_assoc()) {
+            $idx = $tc['reconciliation_id'];
+            if (isset($tc_ots_ids[$idx])) {
+                $tc_ots_ids[$idx][] = (int)$tc['record_id'];
+                $ots_ids[(int)$tc['record_id']] = $idx; // reuse for the fetch
+            }
+        }
+    }
 }
 
 if (!empty($ots_ids)) {
-    $id_list = implode(',', array_keys($ots_ids));
+    $ots_record_ids = array_keys($ots_ids);
+    $id_list = implode(',', array_fill(0, count($ots_record_ids), '?'));
     
-    $ots_result = $conn->query("
+    $ots_sql = "
         SELECT t.RECORD_ID,
                t.DECISION_NUMBER AS ots_decision, t.PERSON_ID, t.TYPE,
                t.CASH_DOCUMENT_NUMBER AS ots_doc,
@@ -1543,7 +1865,15 @@ if (!empty($ots_ids)) {
         LEFT JOIN ots.USERS u ON t.EDITED_BY = u.id
         LEFT JOIN ots.funds funds ON t.FUND_ID = funds.id
         WHERE t.RECORD_ID IN ($id_list)
-    ");
+    ";
+    $ots_stmt = $conn->prepare($ots_sql);
+    $ots_result = false;
+    if ($ots_stmt) {
+        $ots_types = str_repeat('i', count($ots_record_ids));
+        $ots_stmt->bind_param($ots_types, ...$ots_record_ids);
+        $ots_stmt->execute();
+        $ots_result = $ots_stmt->get_result();
+    }
     
     $ots_map = [];
     if ($ots_result) {
@@ -1555,6 +1885,8 @@ if (!empty($ots_ids)) {
     foreach ($ots_ids as $rid => $idx) {
         if (isset($ots_map[$rid])) {
             $o = $ots_map[$rid];
+            // TC többszörös rekordoknál csak az elsőt használjuk
+            if (isset($rows[$idx]['ots_desc_full'])) continue;
             $desc = trim($o['person_name'] . ' ' . ($o['nt1_name'] ?? '') . ' ' . ($o['nt2_name'] ?? ''));
             if (empty($desc)) {
                 $parts = [];
@@ -1645,6 +1977,9 @@ unset($row);
         .filter-input:focus { border-color: #0d6efd; outline: 0; box-shadow: 0 0 3px rgba(13,110,253,0.3); }
         .info-dot { font-size: 10px; color: #0d6efd; vertical-align: super; margin-left: 2px; }
 
+        .checklist-item { padding: 6px 0; border-bottom: 1px solid #eee; }
+        .checklist-item:last-child { border-bottom: none; }
+
         /* Keresőmező design igazítása az új feltöltés gomb stílusához */
         .church-search-box {
             width: 280px;
@@ -1730,32 +2065,34 @@ unset($row);
 
 <div class="container-fluid table-container">
     
-    <div class="d-flex justify-content-between align-items-center mb-2">
-        <div class="d-flex align-items-center gap-2">
-            <h5 class="m-0 me-2">🕵️‍♂️ Revizor Asszisztens 1.0 <small class="text-muted fw-normal ms-1">Bankegyeztetés</small></h5>
-            <a href="index.php" class="btn btn-outline-secondary btn-sm">🏠 Kezdőlap</a>
-            <!-- SZERVEROLDALI GYÜLEKEZET SZŰRŐ -->
-            <form method="GET" action="reconciliation.php" class="d-flex gap-2">
-                <input type="hidden" name="limit" value="<?php echo $limit; ?>">
-                <input type="hidden" id="currentChurchId" value="<?php echo $selected_church_id; ?>">
-                <input list="churchesList" name="church_filter" id="churchSelect" class="form-control church-search-box" placeholder="Válassz gyülekezetet..." value="<?php echo htmlspecialchars($selected_church_name); ?>" onchange="showPerPageLoading(this.form)" autocomplete="off">
-                <datalist id="churchesList">
-                    <?php foreach ($churches as $church): ?>
-                        <option value="<?php echo htmlspecialchars($church); ?>"></option>
-                    <?php endforeach; ?>
-                </datalist>
-                <?php if($selected_church_id !== -1): ?><a href="reconciliation.php" class="btn btn-sm btn-outline-danger" title="Szűrés törlése">✕</a><?php endif; ?>
-            </form>
-        </div>
-        <div>
-            <button class="btn btn-outline-secondary btn-sm fw-bold me-2" onclick="exportTableToCSV()">📥 Excel Export</button>
-            <button class="btn btn-outline-info btn-sm fw-bold me-2" onclick="bulkApproveCsuszas()">✅ Csúszások OKézása</button>
-            <button class="btn btn-outline-success btn-sm fw-bold me-2" onclick="new bootstrap.Modal(document.getElementById('autoMatchModal')).show()">🤖 Automatikus Párosítás</button>
-            <button class="btn btn-outline-warning btn-sm fw-bold me-2" onclick="openCustomPatterns()">🔧 Keyword párok</button>
-            <a href="upload.php" class="btn btn-primary btn-sm me-1">Új banki fájl feltöltése</a>
-            <a href="help.php" class="btn btn-outline-primary btn-sm me-1">❓ Súgó</a>
-            <a href="logout.php" class="btn btn-outline-danger btn-sm">Kilépés</a>
-        </div>
+    <div class="d-flex align-items-center gap-2 mb-2">
+        <h5 class="m-0 text-nowrap">🕵️‍♂️ Revizor Asszisztens 1.0 <small class="text-muted fw-normal ms-1">Bankegyeztetés</small></h5>
+        <a href="index.php" class="btn btn-outline-secondary btn-sm text-nowrap">🏠 Kezdőlap</a>
+        <form method="GET" action="reconciliation.php" class="d-flex gap-1 align-items-center">
+            <input type="hidden" name="limit" value="<?php echo $limit; ?>">
+            <input type="hidden" id="currentChurchId" value="<?php echo $selected_church_id; ?>">
+            <input list="churchesList" name="church_filter" id="churchSelect" class="form-control church-search-box" placeholder="Válassz gyülekezetet..." value="<?php echo htmlspecialchars($selected_church_name); ?>" onchange="showPerPageLoading(this.form)" autocomplete="off" style="height:31px;">
+            <datalist id="churchesList">
+                <?php foreach ($churches as $church): ?>
+                    <option value="<?php echo htmlspecialchars($church); ?>"></option>
+                <?php endforeach; ?>
+            </datalist>
+            <?php if($selected_church_id !== -1): ?><a href="reconciliation.php" class="btn btn-sm btn-outline-danger text-nowrap" title="Szűrés törlése">✕</a><?php endif; ?>
+        </form>
+        <nav class="navbar navbar-light p-0 ms-auto position-relative">
+            <button class="navbar-toggler border-0" type="button" data-bs-toggle="collapse" data-bs-target="#actionMenu" aria-label="Menü">
+                <span class="navbar-toggler-icon"></span>
+            </button>
+            <div class="collapse navbar-collapse position-absolute end-0 top-100" id="actionMenu" style="z-index:1040; min-width:max-content;">
+                <div class="d-flex bg-white border rounded shadow-sm p-1" onclick="var p=document.getElementById('actionMenu'); if(p) p.classList.remove('show');">
+                    <button class="btn btn-outline-secondary btn-sm fw-bold" onclick="exportTableToCSV()">📥 Export</button>
+                    <button class="btn btn-outline-info btn-sm fw-bold" onclick="bulkApproveCsuszas()">✅ Csúszások OK</button>
+                    <button class="btn btn-outline-success btn-sm fw-bold" onclick="requireAdminThen(function(){ new bootstrap.Modal(document.getElementById('autoMatchModal')).show(); })">🤖 Auto Párosítás</button>
+                    <button class="btn btn-outline-warning btn-sm fw-bold" onclick="openCustomPatterns()">🔧 Kulcsszavak</button>
+                    <a href="logout.php" class="btn btn-outline-danger btn-sm">Kilépés</a>
+                </div>
+            </div>
+        </nav>
     </div>
     
     <div class="table-responsive-scroll">
@@ -1812,6 +2149,19 @@ unset($row);
             </thead>
             <tbody>
                 <?php if (!empty($rows)): ?>
+                    <?php 
+                        // Load provider keywords once before rendering rows
+                        static $provider_kws = null;
+                        if ($provider_kws === null) {
+                            $provider_kws = [];
+                            $kw_res = $conn->query("SELECT bank_keyword, ots_keyword FROM provider_keywords ORDER BY id");
+                            if ($kw_res) {
+                                while ($kw = $kw_res->fetch_assoc()) {
+                                    $provider_kws[] = $kw;
+                                }
+                            }
+                        }
+                    ?>
                     <?php foreach($rows as $row): ?>
                     <?php 
                         // Tudástár alkalmazása menet közben a megjelenítéshez (ha a DB-ben még a régi lenne)
@@ -1835,10 +2185,64 @@ unset($row);
                         }
                         // Ellenőrizzük, hogy van-e 100%-os egyezés írásvédelme
                         $is_locked = (strpos($row['comment'] ?? '', '[Auto: 100% egyezés, 0 nap]') !== false);
+
+                        // --- Szöveges egyezés keresése megjelenítéshez ---
+                        $text_matches_display = '';
+                        $bank_text = mb_strtolower(trim(($row['bank_desc'] ?? '') . ' ' . ($row['bank_ext_name'] ?? '')), 'UTF-8');
+                        $ots_text = mb_strtolower(trim($row['ots_desc_full'] ?? ''), 'UTF-8');
+
+                        // Show item count if multiple items matched
+                        if (!empty($row['item_count']) && $row['item_count'] > 1) {
+                            $text_matches_display .= '<div class="small text-secondary">Több tételes: <strong>' . (int)$row['item_count'] . ' db</strong></div>';
+                        }
+
+                        if ($bank_text !== '' && $ots_text !== '') {
+                            // accent normalization map
+                            $accent_map = ['á'=>'a','é'=>'e','í'=>'i','ó'=>'o','ö'=>'o','ő'=>'o','ú'=>'u','ü'=>'u','ű'=>'u'];
+                            $norm = function($s) use ($accent_map) { return strtr($s, $accent_map); };
+
+                            // exact matching (with accents)
+                            $bank_words = preg_split('/[^\p{L}0-9]+/u', $bank_text);
+                            $ots_words = preg_split('/[^\p{L}0-9]+/u', $ots_text);
+                            $bank_flt = [];
+                            foreach ($bank_words as $w) { $w = trim($w); if (mb_strlen($w,'UTF-8') >= 4 && !ctype_digit($w)) $bank_flt[] = $w; }
+                            $ots_flt = [];
+                            foreach ($ots_words as $w) { $w = trim($w); if (mb_strlen($w,'UTF-8') >= 4 && !ctype_digit($w)) $ots_flt[] = $w; }
+                            $common = array_values(array_unique(array_intersect($bank_flt, $ots_flt)));
+
+                            // accent-insensitive matching as fallback
+                            $common_norm = [];
+                            if (empty($common)) {
+                                $bank_norm = array_map($norm, $bank_flt);
+                                $ots_norm = array_map($norm, $ots_flt);
+                                $common_norm = array_values(array_unique(array_intersect($bank_norm, $ots_norm)));
+                            }
+
+                            if (!empty($common)) {
+                                $text_matches_display .= '<div class="small text-info">Szöveg egyezés: <strong>' . htmlspecialchars(implode(', ', array_slice($common, 0, 6))) . '</strong></div>';
+                            } elseif (!empty($common_norm)) {
+                                $text_matches_display .= '<div class="small text-info">Szöveg egyezés (ékezet nélkül): <strong>' . htmlspecialchars(implode(', ', array_slice($common_norm, 0, 6))) . '</strong></div>';
+                            }
+
+                            // provider keyword pairs
+                            $kw_hits = [];
+                            foreach ($provider_kws as $pk) {
+                                $bk = mb_strtolower(trim($pk['bank_keyword']), 'UTF-8');
+                                $ok = mb_strtolower(trim($pk['ots_keyword']), 'UTF-8');
+                                if ($bk === '' || $ok === '') continue;
+                                if (mb_strpos($bank_text, $bk) !== false && mb_strpos($ots_text, $ok) !== false) {
+                                    $kw_hits[] = $pk['bank_keyword'] . ' ↔ ' . $pk['ots_keyword'];
+                                }
+                            }
+                            if (!empty($kw_hits)) {
+                                $kw_hits = array_slice(array_unique($kw_hits), 0, 5);
+                                $text_matches_display .= '<div class="small text-primary">Kulcsszó párok: <strong>' . htmlspecialchars(implode(', ', $kw_hits)) . '</strong></div>';
+                            }
+                        }
                     ?>
                     <tr id="row-<?php echo $row['id']; ?>" class="data-row" data-status="<?php echo $row['status']; ?>" data-church="<?php echo htmlspecialchars($row['church_name'] ?? ''); ?>" data-church-id="<?php echo $row['church_id']; ?>">
                         <td class="bg-light text-muted" style="font-size: 11px;" data-val="<?php echo htmlspecialchars($row['church_name'] ?? ''); ?>">
-                            <strong>ID: <?php echo $row['church_id']; ?></strong><br>
+                            <strong>ID: <?php echo $row['church_id']; ?></strong> / <strong>BR: <?php echo $row['id']; ?></strong><br>
                             <?php echo htmlspecialchars($row['church_name'] ?? 'ISMERETLEN'); ?>
                         </td>
                         <td class="bg-bank text-center" data-val="<?php echo $row['bank_date']; ?>"><?php echo $row['bank_date']; ?></td>
@@ -1895,7 +2299,10 @@ unset($row);
                                 <option value="OSSZEVONT" class="text-primary" <?php if($row['status'] == 'OSSZEVONT') echo 'selected'; ?>>[ÖSSZEVONT]</option>
                             </select>
                         </td>
-                        <td><input type="text" id="comment-<?php echo $row['id']; ?>" class="form-control form-control-sm <?php echo $is_locked ? 'bg-light text-muted' : ''; ?>" value="<?php echo htmlspecialchars($row['comment'] ?? ''); ?>" <?php echo $is_locked ? 'readonly' : ''; ?>></td>
+                        <td>
+                            <input type="text" id="comment-<?php echo $row['id']; ?>" class="form-control form-control-sm <?php echo $is_locked ? 'bg-light text-muted' : ''; ?>" value="<?php echo htmlspecialchars($row['comment'] ?? ''); ?>" <?php echo $is_locked ? 'readonly' : ''; ?>>
+                            <?php if (!empty($text_matches_display)) { echo $text_matches_display; } ?>
+                        </td>
                         <td class="text-center">
                             <?php if ($is_locked): ?>
                                 <button class="btn btn-secondary btn-sm" disabled title="Tökéletes egyezés, írásvédett!">🔒 Kész</button>
@@ -1994,7 +2401,7 @@ unset($row);
         <div class="parallel-row">
           <!-- Bank Side -->
           <div class="parallel-col p-3 border-end">
-            <h6 class="text-primary mb-2 border-bottom pb-1"><strong>Banki Adatok</strong></h6>
+            <h6 class="text-primary mb-2 border-bottom pb-1"><strong>Banki Adatok</strong> <small class="text-muted fw-normal" id="cb_bank_id_label"></small></h6>
             <div id="bankDefaultView">
             <table class="table table-sm table-striped table-bordered">
               <tr id="bankSummaryRow" style="background:#e9ecef;"><th colspan="2" style="padding:0.5rem 0.75rem; line-height:1.4; white-space:nowrap;">
@@ -2012,6 +2419,7 @@ unset($row);
               <tr class="table-light"><th>Kedvezményezett neve:</th><td id="cb_ben_name">-</td></tr>
               <tr class="table-light"><th>Kedvezményezett számla:</th><td id="cb_ben_acc">-</td></tr>
               <tr><th>Tranzakció ID:</th><td id="cb_ext_ref">-</td></tr>
+              <tr class="table-success"><th>Revizor párosította/elfogadta:</th><td id="cb_updated_by">-</td></tr>
             </table>
             </div>
             <div id="bankPairsLeftPanel" style="display:none;">
@@ -2026,7 +2434,7 @@ unset($row);
           <!-- OTS Side -->
           <div class="parallel-col p-3 bg-light">
             <div class="d-flex justify-content-between align-items-center mb-2 border-bottom pb-1">
-                <h6 class="text-secondary m-0"><strong>🧾 OTS Könyvelési Adatok</strong></h6>
+                <h6 class="text-secondary m-0"><strong>🧾 OTS Könyvelési Adatok</strong> <small class="text-muted fw-normal" id="cb_ots_id_label"></small></h6>
                 <div class="d-flex gap-1">
                     <button id="toggleMatchModeBtn" class="btn btn-outline-secondary btn-sm" onclick="toggleMatchMode()" type="button" style="display:none;">☐ Több tételes párosítás</button>
                     <button id="aggregationSearchBtn" class="btn btn-outline-info btn-sm" onclick="aggregationSearch()" type="button" style="display:none;">🔍 Keresés szöveg alapján</button>
@@ -2045,8 +2453,22 @@ unset($row);
             </div>
           </div>
         </div>
-        <div class="comment-bar border-top bg-light p-2 text-center text-muted">
-            <small><strong>Státusz:</strong> <span id="c_status" class="fw-bold">-</span> &middot; <strong>Megjegyzés rovat (Auto-infó):</strong> <span id="c_comment" class="fst-italic">-</span></small>
+        <div class="comment-bar border-top bg-light p-1 px-2 d-flex justify-content-between align-items-center text-muted" style="flex-shrink:0;">
+            <small><strong>Státusz:</strong> <span id="c_status" class="fw-bold">-</span> &middot; <strong>Megjegyzés:</strong> <span id="c_comment" class="fst-italic">-</span></small>
+            <button class="btn btn-outline-primary btn-sm py-0" onclick="toggleAuditPanel()" type="button" id="toggleAuditBtn">📋 Ellenőrzés</button>
+        </div>
+        <div id="auditPanel" style="display:none; flex-shrink:0; max-height:40vh; overflow-y:auto; border-top:1px solid #dee2e6;" class="p-2 bg-white">
+            <form id="auditForm">
+                <input type="hidden" name="bank_reconciliation_id" id="auditBankRecId">
+                <input type="hidden" name="csrf_token" value="<?php echo $_SESSION['csrf_token']; ?>">
+                <div id="auditChecklistContainer" class="row g-1"></div>
+                <div class="d-flex align-items-center gap-2 mt-1">
+                    <input type="text" name="inspector_name" class="form-control form-control-sm" style="width:200px;" value="<?php echo htmlspecialchars($_SESSION[GC_USER_FULL_NAME] ?? ''); ?>" placeholder="Ellenőr neve">
+                    <input type="text" name="notes" class="form-control form-control-sm" style="width:250px;" placeholder="Megjegyzés">
+                    <span id="auditSaveMsg" class="small me-1"></span>
+                    <button class="btn btn-success btn-sm" onclick="saveAuditInline()" type="button">💾 Mentés</button>
+                </div>
+            </form>
         </div>
       </div>
     </div>
@@ -2164,7 +2586,178 @@ unset($row);
 <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
 <script>
 var CSRF_TOKEN = '<?php echo $_SESSION['csrf_token']; ?>';
+var IS_ADMIN = <?= is_admin() ? 'true' : 'false' ?>;
 var AUTO_BANK_ID = <?= $auto_bank_id ?>;
+var CHURCH_NAME_TO_ID = <?php 
+    $name_to_id = [];
+    if (isset($church_names_map)) {
+        foreach ($church_names_map as $id => $name) {
+            $name_to_id[$name] = $id;
+        }
+    }
+    echo json_encode($name_to_id);
+?>;
+
+function showAdminOnlyModal() {
+    document.getElementById('adminOnlyModalTrigger').click();
+}
+
+var _auditLoadedRecId = 0;
+var _currentItemType = 'bank';
+
+var AUDIT_CHECKLISTS = {
+    bank: {
+        title: '🏦 Banki tétel ellenőrzése',
+        groups: [
+            {
+                fields: [
+                    { key: 'bank_in_ots_ok', label: 'Banki tétel OTS-ben szerepel', auto: true },
+                    { key: 'description_ok', label: 'Pontos-e a megnevezés' },
+                    { key: 'decision_number_ok', label: 'Határozatszám' },
+                    { key: 'invoice_ok', label: 'Számla meg van' },
+                    { key: 'fund_designation_ok', label: 'Pénzalap megjelölés helyes' },
+                ]
+            }
+        ]
+    },
+    cash_income: {
+        title: '💰 Bevételi pénztárbizonylat ellenőrzése',
+        groups: [
+            {
+                heading: 'Bizonylat adatok',
+                fields: [
+                    { key: 'cash_voucher_ok', label: 'Pénztárbizonylat rendben' },
+                    { key: 'date_filled', label: 'Dátum kitöltve' },
+                    { key: 'amount_ok', label: 'Összeg pontos' },
+                    { key: 'description_ok', label: 'Megnevezés pontos' },
+                    { key: 'receipt_number_ok', label: 'Bizonylatszám szerepel' },
+                ]
+            },
+            {
+                heading: 'Aláírások / Mellékletek',
+                fields: [
+                    { key: 'signature_receiver', label: 'Felvevő aláírása' },
+                    { key: 'tithe_card_ok', label: 'Tizedcédula megvan' },
+                    { key: 'fund_designation_ok', label: 'Pénzalap megjelölés helyes' },
+                    { key: 'supporting_doc_ok', label: 'Egyéb melléklet' },
+                ]
+            }
+        ]
+    },
+    cash_expense: {
+        title: '💸 Kiadási pénztárbizonylat ellenőrzése',
+        groups: [
+            {
+                heading: 'Bizonylat adatok',
+                fields: [
+                    { key: 'cash_voucher_ok', label: 'Pénztárbizonylat rendben' },
+                    { key: 'date_filled', label: 'Dátum kitöltve' },
+                    { key: 'amount_ok', label: 'Összeg pontos' },
+                    { key: 'description_ok', label: 'Megnevezés pontos' },
+                    { key: 'receipt_number_ok', label: 'Bizonylatszám szerepel' },
+                ]
+            },
+            {
+                heading: 'Aláírások / Mellékletek',
+                fields: [
+                    { key: 'signature_treasurer', label: 'Pénztáros aláírás' },
+                    { key: 'signature_authorizer', label: 'Utalványozó/engedélyező' },
+                    { key: 'invoice_ok', label: 'Számla megvan' },
+                    { key: 'decision_number_ok', label: 'Határozati szám' },
+                    { key: 'fund_designation_ok', label: 'Pénzalap megjelölés helyes' },
+                    { key: 'supporting_doc_ok', label: 'Egyéb melléklet' },
+                ]
+            }
+        ]
+    }
+};
+
+function getItemType() {
+    // Jelenleg minden rekord banki tétel; később készpénz esetén 'cash_income' / 'cash_expense'
+    return 'bank';
+}
+
+function renderAuditChecklist(type) {
+    var container = document.getElementById('auditChecklistContainer');
+    var def = AUDIT_CHECKLISTS[type];
+    if (!def) { container.innerHTML = '<div class="text-muted small">Ismeretlen tétel típus</div>'; return; }
+
+    var html = '<div class="col-12"><h6 class="border-bottom pb-1 mb-1" style="font-size:13px;">' + def.title + '</h6></div>';
+    def.groups.forEach(function(group) {
+        if (group.heading) {
+            html += '<div class="col-12"><strong style="font-size:12px;" class="text-muted">' + group.heading + '</strong></div>';
+        }
+        group.fields.forEach(function(field) {
+            html += '<div class="checklist-item py-1 checklist-field" data-key="' + field.key + '">' +
+                '<div class="form-check">' +
+                '<input class="form-check-input" type="checkbox" name="' + field.key + '" value="1" id="chk_' + field.key + '">' +
+                '<label class="form-check-label" for="chk_' + field.key + '" style="font-size:13px;">' + field.label + '</label>' +
+                '</div></div>';
+        });
+    });
+    container.innerHTML = html;
+}
+
+function toggleAuditPanel() {
+    var panel = document.getElementById('auditPanel');
+    var btn = document.getElementById('toggleAuditBtn');
+    if (panel.style.display !== 'none') {
+        panel.style.display = 'none';
+        btn.innerHTML = '📋 Ellenőrzés';
+        return;
+    }
+    panel.style.display = 'block';
+    btn.innerHTML = '📋 Bezárás';
+    var recId = _currentViewingData ? _currentViewingData.id : 0;
+    if (recId > 0 && recId !== _auditLoadedRecId) {
+        _auditLoadedRecId = recId;
+        document.getElementById('auditBankRecId').value = recId;
+        _currentItemType = getItemType();
+        renderAuditChecklist(_currentItemType);
+        fetch('document_check_get.php?bank_reconciliation_id=' + recId)
+        .then(function(r) { return r.json(); })
+        .then(function(data) {
+            // Összes lehetséges mező végigjárása az audit adatokból
+            var fields = (_currentItemType === 'bank')
+                ? ['bank_in_ots_ok','description_ok','decision_number_ok','invoice_ok','fund_designation_ok']
+                : ['cash_voucher_ok','date_filled','amount_ok','description_ok','signature_treasurer','signature_receiver','signature_authorizer','invoice_ok','tithe_card_ok','receipt_number_ok','decision_number_ok','fund_designation_ok','supporting_doc_ok'];
+            fields.forEach(function(f) {
+                var cb = document.getElementById('chk_' + f);
+                if (cb) cb.checked = data.audit && data.audit[f] == 1;
+            });
+            // Ha a banki tétel párosítva van OTS-ben, a "Banki tétel OTS-ben szerepel" pipa automatikusan
+            if (_currentViewingData && (_currentViewingData.ots_record_id || _currentViewingData.item_count > 0)) {
+                var bankInOts = document.getElementById('chk_bank_in_ots_ok');
+                if (bankInOts) bankInOts.checked = true;
+            }
+            document.querySelector('#auditForm [name="inspector_name"]').value = data.audit ? data.audit.inspector_name : '<?php echo htmlspecialchars($_SESSION[GC_USER_FULL_NAME] ?? ''); ?>';
+            document.querySelector('#auditForm [name="notes"]').value = data.audit ? data.audit.notes : '';
+            document.getElementById('auditSaveMsg').innerHTML = data.audit ? '<span class="text-success">✓ Mentve: ' + (data.audit.checked_at || '') + '</span>' : '';
+        })
+        .catch(function() {});
+    }
+}
+
+function saveAuditInline() {
+    var form = document.getElementById('auditForm');
+    var data = new FormData(form);
+    data.append('action', 'save_audit');
+    data.append('csrf_token', CSRF_TOKEN);
+    document.getElementById('auditSaveMsg').innerHTML = '<span class="spinner-border spinner-border-sm"></span>';
+    fetch('document_check.php', { method: 'POST', body: data })
+    .then(function(r) { return r.json(); })
+    .then(function(result) {
+        document.getElementById('auditSaveMsg').innerHTML = result.status === 'OK' ? '<span class="text-success">✓ Mentve</span>' : '<span class="text-danger">✗ ' + result.message + '</span>';
+    })
+    .catch(function() {
+        document.getElementById('auditSaveMsg').innerHTML = '<span class="text-danger">✗ Hiba</span>';
+    });
+}
+
+function requireAdminThen(fn) {
+    if (IS_ADMIN) { fn(); } else { showAdminOnlyModal(); }
+}
+
 document.addEventListener("DOMContentLoaded", function() {
     var tooltipTriggerList = [].slice.call(document.querySelectorAll('[data-bs-toggle="tooltip"]'));
     tooltipTriggerList.forEach(function (tooltipTriggerEl) {
@@ -2425,6 +3018,10 @@ function mutatKombinaltReszleteket(adatok) {
     _currentViewingRowId = adatok.id || null;
     _currentViewingData = adatok;
     frissitModalSzamlalot();
+    // BR ID megjelenítése
+    var brId = adatok.id || 0;
+    document.getElementById('cb_bank_id_label').textContent = brId > 0 ? '(BR: ' + brId + ')' : '';
+    document.getElementById('cb_ots_id_label').textContent = brId > 0 ? '(BR: ' + brId + ')' : '';
     // Bank adatok
     document.getElementById('cb_church_name').textContent = adatok.church_name ? adatok.church_name : '-';
     document.getElementById('cb_date').textContent = adatok.bank_date;
@@ -2438,6 +3035,7 @@ function mutatKombinaltReszleteket(adatok) {
     document.getElementById('cb_ben_name').textContent = adatok.bank_ben_name ? adatok.bank_ben_name : '-';
     document.getElementById('cb_ben_acc').textContent = adatok.bank_ben_acc ? adatok.bank_ben_acc : '-';
     document.getElementById('cb_ext_ref').textContent = adatok.bank_ext_ref ? adatok.bank_ext_ref : '-';
+    document.getElementById('cb_updated_by').textContent = adatok.updated_by ? adatok.updated_by : '-';
 
     document.getElementById('cb_bank_date_sm').textContent = adatok.bank_date || '';
     document.getElementById('cb_bank_amount_sm').textContent = Number(adatok.bank_amount).toLocaleString('hu-HU') + ' Ft';
@@ -2474,6 +3072,7 @@ function mutatKombinaltReszleteket(adatok) {
 
     const data = new FormData();
     data.append('action', 'get_ots_details');
+    data.append('id', adatok.id || 0);
     data.append('church_id', adatok.church_id || 0);
     data.append('ots_doc', adatok.ots_doc || '');
     data.append('church_name', adatok.church_name || '');
@@ -2570,12 +3169,24 @@ function renderOtsResults(result, adatok, keywords) {
     const bankDate = adatok.bank_date;
     const bankAmt = Number(adatok.bank_amount);
 
-    document.getElementById('toggleMatchModeBtn').style.display = '';
-    document.getElementById('aggregationSearchBtn').style.display = result.unmatched_search ? '' : 'none';
+    document.getElementById('toggleMatchModeBtn').style.display = result.from_existing ? 'none' : '';
+    document.getElementById('aggregationSearchBtn').style.display = (!result.from_existing && result.unmatched_search) ? '' : 'none';
 
     let html = '';
     if (result.unmatched_search) {
         html += '<div class="alert alert-info text-center py-1 small mb-1">🔍 Párosítatlan OTS tételek a banki dátum körüli ±70 napban — válaszd ki a megfelelőt!</div>';
+        html += '<div class="d-flex gap-1 mb-1 align-items-center">' +
+            '<input type="number" id="unmatchedFilterAmount" class="form-control form-control-sm" style="width:120px;" placeholder="Összeg szűrés..." oninput="filterUnmatched()">' +
+            '<select id="unmatchedSortBy" class="form-select form-select-sm" style="width:auto;" onchange="filterUnmatched()">' +
+                '<option value="date_asc">📅 Dátum ↑</option>' +
+                '<option value="date_desc">📅 Dátum ↓</option>' +
+                '<option value="amount_asc">💰 Összeg ↑</option>' +
+                '<option value="amount_desc">💰 Összeg ↓</option>' +
+            '</select>' +
+        '</div>';
+    }
+    if (result.from_existing) {
+        html += '<div class="alert alert-success text-center py-1 small mb-1">✅ Már párosított OTS tételek — a meglévő párosítás alább látható</div>';
     }
     html += '<div class="accordion" id="otsAccordion">';
 
@@ -2593,9 +3204,12 @@ function renderOtsResults(result, adatok, keywords) {
 
         html += '<div class="accordion-item ' + (isExactMatch ? 'border-success' : isAmountMatch ? 'border-warning' : '') + '">' +
             '<h2 class="accordion-header">' +
-                '<button class="accordion-button ' + (isFirst ? '' : 'collapsed') + '" type="button" data-bs-toggle="collapse" data-bs-target="#' + txId + '" aria-expanded="' + isFirst + '">' +
-                    '<input type="radio" name="otsSelect" class="form-check-input me-2 radio-input" value="' + idx + '" data-doc="' + (tx.CASH_DOCUMENT_NUMBER || '') + '" data-record-id="' + recordId + '" data-date="' + (tx.DATETIME || '') + '" data-amount="' + adjAmount + '" ' + (isExactMatch || isFirst ? 'checked' : '') + ' onclick="event.stopPropagation();">' +
-                    '<input type="checkbox" class="form-check-input me-2 checkbox-input" data-doc="' + (tx.CASH_DOCUMENT_NUMBER || '') + '" data-record-id="' + recordId + '" data-date="' + (tx.DATETIME || '') + '" data-amount="' + adjAmount + '" style="display:none;" onchange="event.stopPropagation(); frissitMultiOsszegzo();">' +
+                    '<button class="accordion-button ' + (isFirst ? '' : 'collapsed') + '" type="button" data-bs-toggle="collapse" data-bs-target="#' + txId + '" aria-expanded="' + isFirst + '">' +
+                    (result.from_existing ?
+                    '<span class="badge bg-success me-2">✅ Párosított</span>' :
+                    '<input type="radio" name="otsSelect" class="form-check-input me-2 radio-input" value="' + idx + '" data-doc="' + (tx.CASH_DOCUMENT_NUMBER || '') + '" data-record-id="' + recordId + '" data-date="' + (tx.DATETIME || '') + '" data-amount="' + adjAmount + '" ' + (isExactMatch || isFirst ? 'checked' : '') + ' onclick="event.stopPropagation();">') +
+                    (result.from_existing ? '' :
+                    '<input type="checkbox" class="form-check-input me-2 checkbox-input" data-doc="' + (tx.CASH_DOCUMENT_NUMBER || '') + '" data-record-id="' + recordId + '" data-date="' + (tx.DATETIME || '') + '" data-amount="' + adjAmount + '" style="display:none;" onchange="event.stopPropagation(); frissitMultiOsszegzo();">') +
                     '<span class="fw-bold me-2">#' + (idx + 1) + '</span>' +
                     (isExactMatch ? '<span class="badge bg-success me-1">Egyezés</span>' : isAmountMatch ? '<span class="badge bg-warning text-dark me-1">Összeg egyezik</span>' : '') +
                     '<span class="badge bg-secondary me-2">' + otsDate + '</span>' +
@@ -2688,12 +3302,56 @@ function renderOtsResults(result, adatok, keywords) {
     '</div>';
     otsContainer.innerHTML = html;
 
+    if (result.unmatched_search) {
+        window._unmatchedTransactions = transactions.slice();
+        window._unmatchedResult = result;
+        window._unmatchedAdatok = adatok;
+    }
+
     document.querySelectorAll('#otsAccordion .radio-input').forEach(function(r) {
         r.addEventListener('click', function(e) {
             document.querySelectorAll('#otsAccordion .radio-input').forEach(function(x) { x.checked = false; });
             this.checked = true;
         });
     });
+}
+
+function filterUnmatched() {
+    if (!window._unmatchedTransactions || !window._unmatchedAdatok) return;
+    var filterVal = document.getElementById('unmatchedFilterAmount');
+    var sortVal = document.getElementById('unmatchedSortBy');
+    if (!filterVal || !sortVal) return;
+    var targetAmount = parseFloat(filterVal.value);
+    var sortMode = sortVal.value;
+
+    var data = window._unmatchedTransactions.slice();
+
+    if (!isNaN(targetAmount)) {
+        data = data.filter(function(tx) {
+            return Math.abs(Number(tx.adjusted_amount || tx.AMOUNT || 0) - targetAmount) < 0.01;
+        });
+    }
+
+    data.sort(function(a, b) {
+        var aAmt = Number(a.adjusted_amount || a.AMOUNT || 0);
+        var bAmt = Number(b.adjusted_amount || b.AMOUNT || 0);
+        var aDate = a.DATETIME || '';
+        var bDate = b.DATETIME || '';
+        switch (sortMode) {
+            case 'amount_asc': return aAmt - bAmt;
+            case 'amount_desc': return bAmt - aAmt;
+            case 'date_asc': return aDate < bDate ? -1 : aDate > bDate ? 1 : 0;
+            case 'date_desc': return bDate < aDate ? -1 : bDate > aDate ? 1 : 0;
+            default: return 0;
+        }
+    });
+
+    var newResult = {
+        data: data,
+        unmatched_search: true,
+        from_existing: false
+    };
+    renderOtsResults(newResult, window._unmatchedAdatok);
 }
 
 function aggregationSearch() {
@@ -3148,7 +3806,6 @@ function runAutoMatch() {
     const churchId = document.getElementById('currentChurchId').value;
     if (!allChurches && (!churchId || churchId === '-1')) {
         alert('Előbb válassz ki egy gyülekezetet a szűrőben, vagy kapcsold be a "Minden gyülekezetre" opciót!');
-        finishTimer();
         return;
     }
 
@@ -3212,7 +3869,43 @@ function runAutoMatch() {
     const data = new FormData();
     data.append('action', 'auto_match'); data.append('match_mode', mode); data.append('custom_days', customDays); data.append('church_id', churchId); data.append('csrf_token', CSRF_TOKEN);
     if (allChurches) data.append('all_churches', '1');
-    
+
+    // Create a small status UI element
+    let statusEl = document.getElementById('match-progress-status');
+    if (!statusEl) {
+        statusEl = document.createElement('div');
+        statusEl.id = 'match-progress-status';
+        statusEl.style.position = 'fixed';
+        statusEl.style.right = '16px';
+        statusEl.style.bottom = '16px';
+        statusEl.style.zIndex = 9999;
+        statusEl.style.padding = '10px 14px';
+        statusEl.style.background = 'rgba(0,0,0,0.75)';
+        statusEl.style.color = '#fff';
+        statusEl.style.borderRadius = '6px';
+        statusEl.style.fontFamily = 'monospace';
+        statusEl.innerText = 'Párosítás: indítás...';
+        document.body.appendChild(statusEl);
+    }
+
+    // start polling progress endpoint
+    let poll = true;
+    const pollInterval = 1000;
+    const poller = setInterval(() => {
+        fetch('match_progress.php').then(r => r.json()).then(js => {
+            if (!js) return;
+            if (js.status === 'NONE') { statusEl.innerText = 'Nincs futó párosítás.'; return; }
+            if (js.status === 'RUNNING') {
+                statusEl.innerText = `Feldolgozás: gyülekezet: ${js.current_church || '-'}; feld.: ${js.processed_records || 0}; feld.: ${js.processed_churches || 0}; párosítva: ${js.matched || 0}; össz: ${js.total_unchecked || 0}; ${js.time_sec || 0}s`;
+            } else if (js.status === 'DONE') {
+                statusEl.innerText = `Kész. párosított: ${js.matched || 0}; futási idő: ${js.time_sec || 0}s`;
+                // remove after a short delay
+                setTimeout(() => { if (statusEl) statusEl.remove(); }, 3000);
+                clearInterval(poller);
+            }
+        }).catch(()=>{});
+    }, pollInterval);
+
     fetch('reconciliation.php', { method: 'POST', body: data })
     .then(res => res.json())
     .then(result => {
@@ -3232,6 +3925,9 @@ function runAutoMatch() {
                 msg += `Az egyedi ${customDays} napos ráhagyással: ${result.details.custom} db.`;
             }
             alert(msg);
+            // stop polling and remove status element
+            try { clearInterval(poller); } catch(e){}
+            const el = document.getElementById('match-progress-status'); if (el) el.remove();
             window.location.reload(); // Az oldal újratöltésével frissülnek az új adatok és az írásvédelem
         } else {
             alert('Hiba történt a futtatás során!');
@@ -3374,30 +4070,12 @@ function openCustomPatterns() {
 }
 
 function getSelectedChurchId() {
-    var sel = document.getElementById('cpChurchSelect');
-    var name = sel.value;
-    if (!name) return 0;
-    var mainSelect = document.getElementById('churchSelect');
-    var ds = mainSelect ? mainSelect.getAttribute('list') : null;
-    var dt = document.getElementById('churchesList');
-    var opts = dt ? dt.querySelectorAll('option') : [];
-    for (var i = 0; i < opts.length; i++) {
-        if (opts[i].value === name) {
-            var hiddenInput = document.querySelector('input[name="church_filter"]');
-            var chId = document.getElementById('currentChurchId');
-            if (chId) return parseInt(chId.value);
-            return 0;
-        }
-    }
-    return 0;
+    var name = document.getElementById('cpChurchSelect').value;
+    return CHURCH_NAME_TO_ID[name] || 0;
 }
 
 function getChurchNameToId(name) {
-    var hiddenInput = document.querySelector('input[name="church_filter"]');
-    if (!hiddenInput) return 0;
-    var chId = document.getElementById('currentChurchId');
-    if (chId) return parseInt(chId.value);
-    return 0;
+    return CHURCH_NAME_TO_ID[name] || 0;
 }
 
 function loadCustomPatterns() {
@@ -3521,57 +4199,6 @@ function formatTime(sec) {
     var s = sec % 60;
     return m + ' perc ' + s + ' mp';
 }
-
-function checkSession() {
-    sessionRemaining--;
-    if (sessionRemaining <= 300 && !sessionWarningShown) {
-        sessionWarningShown = true;
-        document.getElementById('sessionWarnTime').textContent = formatTime(sessionRemaining);
-        new bootstrap.Modal(document.getElementById('sessionWarnModal')).show();
-    }
-    if (sessionRemaining <= 0) {
-        window.location.href = 'login.php';
-    }
-}
-
-function checkSessionServer() {
-    var data = new FormData();
-    data.append('action', 'check_session');
-    fetch('reconciliation.php', { method: 'POST', body: data })
-    .then(function(res) { return res.json(); })
-    .then(function(result) {
-        if (result.status === 'EXPIRED') {
-            window.location.href = 'login.php';
-        } else if (result.status === 'OK') {
-            sessionRemaining = result.remaining;
-            if (sessionRemaining > 300 && sessionWarningShown) {
-                sessionWarningShown = false;
-                var modal = bootstrap.Modal.getInstance(document.getElementById('sessionWarnModal'));
-                if (modal) modal.hide();
-            }
-        }
-    })
-    .catch(function() {});
-}
-
-function extendSession() {
-    var data = new FormData();
-    data.append('action', 'keepalive');
-    data.append('csrf_token', CSRF_TOKEN);
-    fetch('reconciliation.php', { method: 'POST', body: data })
-    .then(function(res) { return res.json(); })
-    .then(function(result) {
-        if (result.status === 'OK') {
-            sessionRemaining = result.remaining;
-            sessionWarningShown = false;
-            bootstrap.Modal.getInstance(document.getElementById('sessionWarnModal')).hide();
-        }
-    })
-    .catch(function() {});
-}
-
-setInterval(checkSession, 1000);
-setInterval(checkSessionServer, 10000);
 </script>
 
 <!-- SESSION WARNING MODAL -->
@@ -3587,6 +4214,28 @@ setInterval(checkSessionServer, 10000);
       </div>
       <div class="modal-footer justify-content-center">
         <button type="button" class="btn btn-warning fw-bold" onclick="extendSession()">🔁 Hosszabbítás +60 perc</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ADMIN-ONLY MODAL TRIGGER (hidden, used by JS/Bootstrap data-bs-toggle) -->
+<button id="adminOnlyModalTrigger" type="button" class="d-none" data-bs-toggle="modal" data-bs-target="#adminOnlyModal"></button>
+
+<!-- ADMIN-ONLY MODAL -->
+<div class="modal fade" id="adminOnlyModal" tabindex="-1" aria-hidden="true">
+  <div class="modal-dialog modal-sm modal-dialog-centered">
+    <div class="modal-content border-danger">
+      <div class="modal-header bg-danger text-white">
+        <h6 class="modal-title">🚫 Jogosultság megtagadva</h6>
+        <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
+      </div>
+      <div class="modal-body text-center py-4">
+        <p class="mb-1 fw-bold">Ehhez nincs jogosultságod.</p>
+        <p class="text-muted small">Ezt a funkciót csak az adminisztrátor használhatja.</p>
+      </div>
+      <div class="modal-footer justify-content-center border-0 pt-0">
+        <button type="button" class="btn btn-secondary btn-sm" data-bs-dismiss="modal">Bezárás</button>
       </div>
     </div>
   </div>
@@ -3640,7 +4289,11 @@ function updateSessionDisplay() {
 function extendSession() {
     if (sessionExtending) return;
     sessionExtending = true;
-    fetch('session_ping.php')
+    fetch('session_ping.php', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8' },
+        body: 'action=keepalive&csrf_token=' + encodeURIComponent(CSRF_TOKEN)
+    })
     .then(r => r.json())
     .then(data => {
         if (data.remaining) {
@@ -3657,6 +4310,13 @@ function extendSession() {
     .finally(() => { sessionExtending = false; });
 }
 
+function updateSessionWarningDisplay() {
+    var warnTime = document.getElementById('sessionWarnTime');
+    if (warnTime) {
+        warnTime.textContent = formatTime(sessionRemaining);
+    }
+}
+
 setInterval(extendSession, 30000);
 
 setInterval(() => {
@@ -3664,8 +4324,12 @@ setInterval(() => {
     updateSessionDisplay();
     if (sessionRemaining < 120 && !sessionWarningShown) {
         sessionWarningShown = true;
+        updateSessionWarningDisplay();
         const modal = new bootstrap.Modal(document.getElementById('sessionWarningModal'));
         modal.show();
+    }
+    if (sessionWarningShown) {
+        updateSessionWarningDisplay();
     }
     if (sessionRemaining <= 0) {
         window.location.href = 'logout.php';

@@ -16,16 +16,14 @@ if (!isset($_SESSION[GC_LOGIN_COOKIE])) {
     exit;
 }
 
-define('REVIZOR_SESSION_DURATION', 1200);
-if (!isset($_SESSION['revizor_expires_at'])) {
-    $_SESSION['revizor_expires_at'] = time() + REVIZOR_SESSION_DURATION;
-}
-if (time() >= $_SESSION['revizor_expires_at']) {
-    session_destroy();
-    header('Location: login.php');
-    exit;
-}
-$session_remaining = $_SESSION['revizor_expires_at'] - time();
+// load auth helpers and build context
+require_once __DIR__ . '/lib/bootstrap.php';
+require_once __DIR__ . '/lib/auth.php';
+require_once __DIR__ . '/lib/session.php';
+build_user_context_from_ots();
+
+$session_remaining = ensure_revizor_session_timeout();
+ensure_revizor_csrf_token();
 ?>
 <!DOCTYPE html>
 <html lang="hu">
@@ -78,6 +76,7 @@ $session_remaining = $_SESSION['revizor_expires_at'] - time();
                 </div>
             </a>
         </div>
+        <?php if (is_admin()): ?>
         <div class="col-md-4">
             <a href="upload.php" class="card-link">
                 <div class="card p-4 h-100">
@@ -92,6 +91,7 @@ $session_remaining = $_SESSION['revizor_expires_at'] - time();
                 </div>
             </a>
         </div>
+        <?php endif; ?>
         <div class="col-md-4">
             <a href="all_transactions/all_transactions_multi.php" class="card-link">
                 <div class="card p-4 h-100">
@@ -154,10 +154,14 @@ $session_remaining = $_SESSION['revizor_expires_at'] - time();
         <a href="reconciliation.php" class="btn btn-primary btn-lg px-5">🏦 Tovább a Bankegyeztetéshez</a>
     </div>
 
+    <?php if (is_admin()): ?>
     <div class="text-center mt-4 pt-3 border-top">
-        <a href="reset_db.php" class="text-muted small text-decoration-none">🧹 Fejlesztői eszközök</a>
+        <a href="database/reset.php" class="text-muted small text-decoration-none">🧹 Adatbázis reset</a>
     </div>
+    <?php endif; ?>
 </div>
+
+<script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
 
 <!-- Session warning modal -->
 <div class="modal fade" id="sessionWarningModal" data-bs-backdrop="static" tabindex="-1">
@@ -179,6 +183,7 @@ $session_remaining = $_SESSION['revizor_expires_at'] - time();
 </div>
 
 <script>
+var CSRF_TOKEN = '<?php echo $_SESSION['csrf_token']; ?>';
 let sessionRemaining = <?= max(0, $session_remaining) ?>;
 let sessionWarningShown = false;
 let sessionExtending = false;
@@ -197,7 +202,11 @@ function updateSessionDisplay() {
 function extendSession() {
     if (sessionExtending) return;
     sessionExtending = true;
-    fetch('session_ping.php')
+    fetch('session_ping.php', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8' },
+        body: 'action=keepalive&csrf_token=' + encodeURIComponent(CSRF_TOKEN)
+    })
     .then(r => r.json())
     .then(data => {
         if (data.remaining) {

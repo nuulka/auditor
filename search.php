@@ -19,29 +19,14 @@ if (!isset($_SESSION[GC_LOGIN_COOKIE])) {
 // load common auth helpers and build user context
 require_once __DIR__ . '/lib/bootstrap.php';
 require_once __DIR__ . '/lib/auth.php';
+require_once __DIR__ . '/lib/session.php';
 build_user_context_from_ots();
+$accessible_church_ids = get_accessible_church_ids();
 
-define('REVIZOR_SESSION_DURATION', 1200);
-if (!isset($_SESSION['revizor_expires_at'])) {
-    $_SESSION['revizor_expires_at'] = time() + REVIZOR_SESSION_DURATION;
-}
-if (time() >= $_SESSION['revizor_expires_at']) {
-    session_destroy();
-    header('Location: login.php');
-    exit;
-}
+$session_remaining = ensure_revizor_session_timeout();
 
-$conn = new mysqli('localhost', 'root', '', 'revizor_db');
-if ($conn->connect_error) {
-    die('Adatbázis kapcsolódási hiba');
-}
-$conn->set_charset('utf8mb4');
-
-$ots_db = new mysqli('localhost', 'root', '', 'ots');
-if ($ots_db->connect_error) {
-    die('OTS adatbázis kapcsolódási hiba');
-}
-$ots_db->set_charset('utf8mb4');
+$conn = get_revizor_conn();
+$ots_db = get_ots_conn();
 
 // Kiadás típusok meghatározása
 $exp_types = [];
@@ -73,15 +58,27 @@ if (is_admin()) {
     }
 } else {
     $allowed = get_accessible_church_ids();
+    $allowed = array_values(array_filter(array_map('intval', $allowed), function ($v) { return $v > 0; }));
     if (!empty($allowed)) {
-        $ids = implode(',', array_map('intval', $allowed));
-        $ch_res = $conn->query("SELECT id, name FROM ots.churches WHERE id IN ($ids) ORDER BY name ASC");
-        if ($ch_res) { while ($ch = $ch_res->fetch_assoc()) { $churches[] = $ch; } }
+        $placeholders = implode(',', array_fill(0, count($allowed), '?'));
+        $ch_sql = "SELECT id, name FROM ots.churches WHERE id IN ($placeholders) ORDER BY name ASC";
+        $ch_stmt = $conn->prepare($ch_sql);
+        if ($ch_stmt) {
+            $types = str_repeat('i', count($allowed));
+            $ch_stmt->bind_param($types, ...$allowed);
+            $ch_stmt->execute();
+            $ch_res = $ch_stmt->get_result();
+            if ($ch_res) { while ($ch = $ch_res->fetch_assoc()) { $churches[] = $ch; } }
+        }
     }
 }
 
 // Search params
 $source = isset($_GET['source']) ? $_GET['source'] : 'bank';
+$source_whitelist = ['bank', 'ots', 'both'];
+if (!in_array($source, $source_whitelist, true)) {
+    $source = 'bank';
+}
 $church_id = isset($_GET['church_id']) ? intval($_GET['church_id']) : 0;
 // if a church is requested, ensure the user has access
 if ($church_id > 0) {
@@ -89,45 +86,40 @@ if ($church_id > 0) {
 }
 $amount_min = isset($_GET['amount_min']) && $_GET['amount_min'] !== '' ? floatval($_GET['amount_min']) : null;
 $amount_max = isset($_GET['amount_max']) && $_GET['amount_max'] !== '' ? floatval($_GET['amount_max']) : null;
-$date_from = isset($_GET['date_from']) ? trim($_GET['date_from']) : '';
-$date_to = isset($_GET['date_to']) ? trim($_GET['date_to']) : '';
+$date_from_input = isset($_GET['date_from']) ? trim($_GET['date_from']) : '';
+$date_to_input = isset($_GET['date_to']) ? trim($_GET['date_to']) : '';
 $description = isset($_GET['description']) ? trim($_GET['description']) : '';
 $doc_number = isset($_GET['doc_number']) ? trim($_GET['doc_number']) : '';
 $flow = isset($_GET['flow']) ? $_GET['flow'] : 'bank';
+$flow_whitelist = ['bank', 'cash', 'both'];
+if (!in_array($flow, $flow_whitelist, true)) {
+    $flow = 'bank';
+}
 $status_filter = isset($_GET['status_filter']) ? $_GET['status_filter'] : 'all';
+$status_whitelist = ['all', 'matched', 'unmatched'];
+if (!in_array($status_filter, $status_whitelist, true)) {
+    $status_filter = 'all';
+}
 $page = isset($_GET['page']) ? max(1, intval($_GET['page'])) : 1;
 $per_page = 50;
 $offset = ($page - 1) * $per_page;
-$session_remaining = $_SESSION['revizor_expires_at'] - time();
 $export = isset($_GET['export']) && $_GET['export'] === 'csv';
 $exact_word = isset($_GET['exact_word']) && $_GET['exact_word'] === '1';
 
-$has_search = $church_id > 0 || $amount_min !== null || $amount_max !== null || $date_from !== '' || $date_to !== '' || $description !== '' || $doc_number !== '';
-
-function build_where($prefix, $params) {
-    $w = [];
-    $vals = [];
-    if ($params['church_id'] > 0) {
-        $w[] = "$prefix.church_id = " . intval($params['church_id']);
+function normalize_search_date($value) {
+    if ($value === '') {
+        return '';
     }
-    if ($params['amount_min'] !== null) {
-        $w[] = "$prefix.amount >= " . floatval($params['amount_min']);
+    $dt = DateTime::createFromFormat('Y-m-d', $value);
+    if ($dt instanceof DateTime && $dt->format('Y-m-d') === $value) {
+        return $value;
     }
-    if ($params['amount_max'] !== null) {
-        $w[] = "$prefix.amount <= " . floatval($params['amount_max']);
-    }
-    if ($params['date_from']) {
-        $w[] = "$prefix.date >= '" . $params['date_from'] . "'";
-    }
-    if ($params['date_to']) {
-        $w[] = "$prefix.date <= '" . $params['date_to'] . "'";
-    }
-    if ($params['description']) {
-        $esc = $params['conn']->real_escape_string($params['description']);
-        $w[] = "$prefix.description LIKE '%$esc%'";
-    }
-    return [implode(' AND ', $w), $vals];
+    return '';
 }
+
+$date_from = normalize_search_date($date_from_input);
+$date_to = normalize_search_date($date_to_input);
+$has_search = $church_id > 0 || $amount_min !== null || $amount_max !== null || $date_from !== '' || $date_to !== '' || $description !== '' || $doc_number !== '';
 
 $results = [];
 $total = 0;
@@ -141,34 +133,53 @@ try {
     if ($source === 'bank' || $source === 'both') {
         $b_where = [];
         $b_params = [];
+        $b_types = '';
 
         if ($church_id > 0) {
-            $b_where[] = 'br.church_id = ' . intval($church_id);
+            $b_where[] = 'br.church_id = ?';
+            $b_params[] = $church_id;
+            $b_types .= 'i';
+        } elseif (!is_admin()) {
+            if (empty($accessible_church_ids)) {
+                $b_where[] = '1=0';
+            } else {
+                append_int_in_clause($b_where, $b_params, $b_types, 'br.church_id', $accessible_church_ids);
+            }
         }
         if ($amount_min !== null) {
-            $b_where[] = 'br.bank_amount >= ' . floatval($amount_min);
+            $b_where[] = 'br.bank_amount >= ?';
+            $b_params[] = floatval($amount_min);
+            $b_types .= 'd';
         }
         if ($amount_max !== null) {
-            $b_where[] = 'br.bank_amount <= ' . floatval($amount_max);
+            $b_where[] = 'br.bank_amount <= ?';
+            $b_params[] = floatval($amount_max);
+            $b_types .= 'd';
         }
         if ($date_from) {
-            $b_where[] = "br.bank_date >= '$date_from'";
+            $b_where[] = 'br.bank_date >= ?';
+            $b_params[] = $date_from;
+            $b_types .= 's';
         }
         if ($date_to) {
-            $b_where[] = "br.bank_date <= '$date_to'";
+            $b_where[] = 'br.bank_date <= ?';
+            $b_params[] = $date_to;
+            $b_types .= 's';
         }
         if ($description) {
-            $desc_esc = $conn->real_escape_string($description);
             if ($exact_word) {
-                $desc_re = $conn->real_escape_string(preg_quote($description, '/'));
-                $b_where[] = "(br.bank_desc REGEXP '[[:<:]]{$desc_re}[[:>:]]' OR br.bank_ext_name REGEXP '[[:<:]]{$desc_re}[[:>:]]' OR br.bank_init_name REGEXP '[[:<:]]{$desc_re}[[:>:]]' OR br.bank_ben_name REGEXP '[[:<:]]{$desc_re}[[:>:]]')";
+                $b_where[] = "(br.bank_desc REGEXP ? OR br.bank_ext_name REGEXP ? OR br.bank_init_name REGEXP ? OR br.bank_ben_name REGEXP ?)";
+                $desc_re = preg_quote($description, '/');
+                for ($i = 0; $i < 4; $i++) { $b_params[] = "[[:<:]]{$desc_re}[[:>:]]"; $b_types .= 's'; }
             } else {
-                $b_where[] = "(br.bank_desc LIKE '%$desc_esc%' OR br.bank_ext_name LIKE '%$desc_esc%' OR br.bank_init_name LIKE '%$desc_esc%' OR br.bank_ben_name LIKE '%$desc_esc%')";
+                $b_where[] = "(br.bank_desc LIKE ? OR br.bank_ext_name LIKE ? OR br.bank_init_name LIKE ? OR br.bank_ben_name LIKE ?)";
+                for ($i = 0; $i < 4; $i++) { $b_params[] = "%$description%"; $b_types .= 's'; }
             }
         }
         if ($doc_number) {
-            $doc_esc = $conn->real_escape_string($doc_number);
-            $b_where[] = "(br.ots_doc LIKE '%$doc_esc%' OR br.bank_ext_ref LIKE '%$doc_esc%')";
+            $b_where[] = "(br.ots_doc LIKE ? OR br.bank_ext_ref LIKE ?)";
+            $b_params[] = "%$doc_number%"; $b_types .= 's';
+            $b_params[] = "%$doc_number%"; $b_types .= 's';
         }
         if ($status_filter === 'matched') {
             $b_where[] = "(br.ots_record_id IS NOT NULL OR br.id IN (SELECT reconciliation_id FROM bank_reconciliation_items))";
@@ -182,7 +193,16 @@ try {
         $dedup_sub = "INNER JOIN (SELECT MIN(id) AS dedup_id FROM bank_reconciliation GROUP BY church_id, bank_date, bank_amount, bank_desc) d ON br.id = d.dedup_id";
 
         // Count
-        $count_res = $conn->query("SELECT COUNT(*) as cnt FROM bank_reconciliation br $dedup_sub $b_where_sql");
+        if (!empty($b_params)) {
+            $stmt = $conn->prepare("SELECT COUNT(*) as cnt FROM bank_reconciliation br $dedup_sub $b_where_sql");
+            if ($stmt) {
+                $stmt->bind_param($b_types, ...$b_params);
+                $stmt->execute();
+                $count_res = $stmt->get_result();
+            } else { $count_res = false; }
+        } else {
+            $count_res = $conn->query("SELECT COUNT(*) as cnt FROM bank_reconciliation br $dedup_sub $b_where_sql");
+        }
         if ($count_res) {
             $total += intval($count_res->fetch_assoc()['cnt']);
         }
@@ -192,7 +212,16 @@ try {
         } else {
             $b_sql = "SELECT br.*, c.name AS church_name FROM bank_reconciliation br $dedup_sub LEFT JOIN ots.churches c ON br.church_id = c.id $b_where_sql ORDER BY br.bank_date DESC";
         }
-        $b_res = $conn->query($b_sql);
+        if (!empty($b_params)) {
+            $stmt = $conn->prepare($b_sql);
+            if ($stmt) {
+                $stmt->bind_param($b_types, ...$b_params);
+                $stmt->execute();
+                $b_res = $stmt->get_result();
+            } else { $b_res = false; }
+        } else {
+            $b_res = $conn->query($b_sql);
+        }
         if ($b_res) {
             while ($row = $b_res->fetch_assoc()) {
                 $row['_source'] = 'Bank';
@@ -206,19 +235,35 @@ try {
 
         $o_where = ["T.CHURCH_ID > 0"];
         $o_params = [];
+        $o_types = '';
 
         if ($church_id > 0) {
-            $o_where[] = 'T.CHURCH_ID = ' . intval($church_id);
+            $o_where[] = 'T.CHURCH_ID = ?';
+            $o_params[] = $church_id;
+            $o_types .= 'i';
+        } elseif (!is_admin()) {
+            if (empty($accessible_church_ids)) {
+                $o_where[] = '1=0';
+            } else {
+                append_int_in_clause($o_where, $o_params, $o_types, 'T.CHURCH_ID', $accessible_church_ids);
+            }
         }
         if ($date_from) {
-            $o_where[] = "T.DATETIME >= '$date_from'";
+            $o_where[] = 'T.DATETIME >= ?';
+            $o_params[] = $date_from;
+            $o_types .= 's';
         }
         if ($date_to) {
-            $o_where[] = "T.DATETIME <= '$date_to 23:59:59'";
+            $o_where[] = 'T.DATETIME <= ?';
+            $o_params[] = $date_to . ' 23:59:59';
+            $o_types .= 's';
         }
         if ($doc_number) {
-            $doc_esc = $ots_db->real_escape_string($doc_number);
-            $o_where[] = "(T.CASH_DOCUMENT_NUMBER LIKE '%$doc_esc%' OR T.DECISION_NUMBER LIKE '%$doc_esc%')";
+            $o_where[] = "(T.CASH_DOCUMENT_NUMBER LIKE ? OR T.DECISION_NUMBER LIKE ?)";
+            $o_params[] = "%$doc_number%";
+            $o_types .= 's';
+            $o_params[] = "%$doc_number%";
+            $o_types .= 's';
         }
 
         // Flow filter (VIA_BANK)
@@ -235,22 +280,34 @@ try {
 
         // Amount filter on adjusted_amount
         $o_having = [];
+        $o_having_params = [];
+        $o_having_types = '';
         if ($amount_min !== null) {
-            $o_having[] = 'adjusted_amount >= ' . floatval($amount_min);
+            $o_having[] = 'adjusted_amount >= ?';
+            $o_having_params[] = floatval($amount_min);
+            $o_having_types .= 'd';
         }
         if ($amount_max !== null) {
-            $o_having[] = 'adjusted_amount <= ' . floatval($amount_max);
+            $o_having[] = 'adjusted_amount <= ?';
+            $o_having_params[] = floatval($amount_max);
+            $o_having_types .= 'd';
         }
 
         // Description filter (PERSONS.NAME, NAMES_OF_TRANSACTION.NAME)
-        $o_desc_join = '';
         if ($description) {
-            $desc_esc = $ots_db->real_escape_string($description);
             if ($exact_word) {
-                $desc_re = $ots_db->real_escape_string(preg_quote($description, '/'));
-                $o_where[] = "(p.NAME REGEXP '[[:<:]]{$desc_re}[[:>:]]' OR p.NAME_PREFIX REGEXP '[[:<:]]{$desc_re}[[:>:]]' OR p.NAME_SUFFIX REGEXP '[[:<:]]{$desc_re}[[:>:]]' OR nt1.NAME REGEXP '[[:<:]]{$desc_re}[[:>:]]' OR nt2.NAME REGEXP '[[:<:]]{$desc_re}[[:>:]]' OR f.NAME REGEXP '[[:<:]]{$desc_re}[[:>:]]')";
+                $desc_re = '[[:<:]]' . preg_quote($description, '/') . '[[:>:]]';
+                $o_where[] = "(p.NAME REGEXP ? OR p.NAME_PREFIX REGEXP ? OR p.NAME_SUFFIX REGEXP ? OR nt1.NAME REGEXP ? OR nt2.NAME REGEXP ? OR f.NAME REGEXP ?)";
+                for ($i = 0; $i < 6; $i++) {
+                    $o_params[] = $desc_re;
+                    $o_types .= 's';
+                }
             } else {
-                $o_where[] = "(p.NAME LIKE '%$desc_esc%' OR p.NAME_PREFIX LIKE '%$desc_esc%' OR p.NAME_SUFFIX LIKE '%$desc_esc%' OR nt1.NAME LIKE '%$desc_esc%' OR nt2.NAME LIKE '%$desc_esc%' OR f.NAME LIKE '%$desc_esc%')";
+                $o_where[] = "(p.NAME LIKE ? OR p.NAME_PREFIX LIKE ? OR p.NAME_SUFFIX LIKE ? OR nt1.NAME LIKE ? OR nt2.NAME LIKE ? OR f.NAME LIKE ?)";
+                for ($i = 0; $i < 6; $i++) {
+                    $o_params[] = "%$description%";
+                    $o_types .= 's';
+                }
             }
         }
 
@@ -268,8 +325,21 @@ try {
 
         // Count for OTS
         if ($source !== 'both') {
-            $o_count_sql = "SELECT COUNT(*) as cnt FROM (SELECT T.RECORD_ID $base_joins WHERE $o_where_sql GROUP BY T.RECORD_ID $o_having_sql) sub";
-            $count_res = $ots_db->query($o_count_sql);
+            $o_count_sql = "SELECT COUNT(*) as cnt FROM (SELECT T.RECORD_ID, $adjusted_sql AS adjusted_amount $base_joins WHERE $o_where_sql GROUP BY T.RECORD_ID $o_having_sql) sub";
+            $count_params = array_merge($o_params, $o_having_params);
+            $count_types = $o_types . $o_having_types;
+            if (!empty($count_params)) {
+                $stmt = $ots_db->prepare($o_count_sql);
+                if ($stmt) {
+                    $stmt->bind_param($count_types, ...$count_params);
+                    $stmt->execute();
+                    $count_res = $stmt->get_result();
+                } else {
+                    $count_res = false;
+                }
+            } else {
+                $count_res = $ots_db->query($o_count_sql);
+            }
             if ($count_res) {
                 $total += intval($count_res->fetch_assoc()['cnt']);
             }
@@ -289,7 +359,20 @@ try {
         } else {
             $o_sql = "SELECT $select_cols $base_joins WHERE $o_where_sql GROUP BY T.RECORD_ID $o_having_sql ORDER BY T.DATETIME DESC";
         }
-        $o_res = $ots_db->query($o_sql);
+        $query_params = array_merge($o_params, $o_having_params);
+        $query_types = $o_types . $o_having_types;
+        if (!empty($query_params)) {
+            $stmt = $ots_db->prepare($o_sql);
+            if ($stmt) {
+                $stmt->bind_param($query_types, ...$query_params);
+                $stmt->execute();
+                $o_res = $stmt->get_result();
+            } else {
+                $o_res = false;
+            }
+        } else {
+            $o_res = $ots_db->query($o_sql);
+        }
         // Párosított OTS record_id-k lekérése
         $paired_ots_ids = [];
         $pair_res = $conn->query("SELECT DISTINCT ots_record_id FROM bank_reconciliation WHERE ots_record_id IS NOT NULL UNION SELECT DISTINCT record_id FROM bank_reconciliation_items");
@@ -762,7 +845,11 @@ function updateSessionDisplay() {
 function extendSession() {
     if (sessionExtending) return;
     sessionExtending = true;
-    fetch('session_ping.php')
+    fetch('session_ping.php', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8' },
+        body: 'action=keepalive&csrf_token=' + encodeURIComponent(CSRF_TOKEN)
+    })
     .then(r => r.json())
     .then(data => {
         if (data.remaining) {

@@ -6,23 +6,31 @@ if (session_status() != PHP_SESSION_ACTIVE) { session_start(); }
 $_SESSION[GN_LAST_ACTIVE] = time();
 require_once __DIR__ . '/../ots/session_handler.php';
 if (!isset($_SESSION[GC_LOGIN_COOKIE])) { header('Location: login.php'); exit; }
-if (empty($_SESSION['csrf_token'])) { $_SESSION['csrf_token'] = bin2hex(random_bytes(32)); }
-define('REVIZOR_SESSION_DURATION', 1200);
-if (!isset($_SESSION['revizor_expires_at'])) { $_SESSION['revizor_expires_at'] = time() + REVIZOR_SESSION_DURATION; }
-if (time() >= $_SESSION['revizor_expires_at']) { session_destroy(); header('Location: login.php'); exit; }
-$session_remaining = $_SESSION['revizor_expires_at'] - time();
-$conn = new mysqli('localhost', 'root', '', 'revizor_db');
-if ($conn->connect_error) { die("Database connection failed"); }
-$conn->set_charset("utf8mb4");
-
 require_once __DIR__ . '/lib/bootstrap.php';
+$conn = get_revizor_conn();
 require_once __DIR__ . '/lib/auth.php';
+require_once __DIR__ . '/lib/session.php';
 // ensure user context built
 build_user_context_from_ots();
+$accessible_church_ids = get_accessible_church_ids();
+$session_remaining = ensure_revizor_session_timeout();
+ensure_revizor_csrf_token();
 
 $church_id = isset($_GET['church_id']) ? intval($_GET['church_id']) : 0;
-$date_from = isset($_GET['date_from']) ? trim($_GET['date_from']) : '';
-$date_to = isset($_GET['date_to']) ? trim($_GET['date_to']) : '';
+function normalize_doccheck_date($value) {
+    $value = trim((string)$value);
+    if ($value === '') {
+        return '';
+    }
+    $dt = DateTime::createFromFormat('Y-m-d', $value);
+    if ($dt instanceof DateTime && $dt->format('Y-m-d') === $value) {
+        return $value;
+    }
+    return '';
+}
+
+$date_from = normalize_doccheck_date($_GET['date_from'] ?? '');
+$date_to = normalize_doccheck_date($_GET['date_to'] ?? '');
 
 // AJAX: audit checklist mentése
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['action'] === 'save_audit') {
@@ -43,52 +51,98 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['
     } else {
         require_church_access(0); // will fail
     }
-    $fields = ['cash_voucher_ok','date_filled','amount_ok','description_ok','signature_treasurer','signature_receiver','signature_authorizer','invoice_ok','tithe_card_ok','receipt_number_ok','decision_number_ok','fund_designation_ok','supporting_doc_ok'];
-    $set_parts = [];
-    foreach ($fields as $f) {
-        $v = isset($_POST[$f]) && $_POST[$f] === '1' ? 1 : 0;
-        $set_parts[] = "$f = $v";
-    }
-    $inspector = $conn->real_escape_string($_POST['inspector_name'] ?? $_SESSION[GC_USER_FULL_NAME] ?? 'Ismeretlen');
-    $notes = $conn->real_escape_string($_POST['notes'] ?? '');
+    $fields = ['cash_voucher_ok','date_filled','amount_ok','description_ok','signature_treasurer','signature_receiver','signature_authorizer','invoice_ok','tithe_card_ok','receipt_number_ok','decision_number_ok','fund_designation_ok','supporting_doc_ok','bank_in_ots_ok'];
+    $inspector = mb_substr(trim((string)($_POST['inspector_name'] ?? $_SESSION[GC_USER_FULL_NAME] ?? 'Ismeretlen')), 0, 100, 'UTF-8');
+    $notes = mb_substr(trim((string)($_POST['notes'] ?? '')), 0, 1000, 'UTF-8');
     $checked_at = date('Y-m-d H:i:s');
-    $vals = [];
-    foreach ($fields as $f) {
-        $vals[] = isset($_POST[$f]) && $_POST[$f] === '1' ? 1 : 0;
-    }
+    $field_placeholders = implode(',', array_fill(0, count($fields), '?'));
+    $set_placeholders = implode(',', array_map(function($f) { return "$f = VALUES($f)"; }, $fields));
     $sql = "INSERT INTO audit_checklist (bank_reconciliation_id, inspector_name, checked_at, " . implode(',', $fields) . ", notes)
-            VALUES ($bank_rec_id, '$inspector', '$checked_at', " . implode(',', $vals) . ", '$notes')
-            ON DUPLICATE KEY UPDATE inspector_name='$inspector', checked_at='$checked_at', notes='$notes', " . implode(',', $set_parts);
-    $conn->query($sql);
+            VALUES (?, ?, ?, $field_placeholders, ?)
+            ON DUPLICATE KEY UPDATE inspector_name = VALUES(inspector_name), checked_at = VALUES(checked_at), notes = VALUES(notes), $set_placeholders";
+    $stmt = $conn->prepare($sql);
+    if ($stmt) {
+        $types = str_repeat('i', 1) . 'ss' . str_repeat('i', count($fields)) . 's';
+        $params = [$bank_rec_id, $inspector, $checked_at];
+        foreach ($fields as $f) {
+            $params[] = isset($_POST[$f]) && $_POST[$f] === '1' ? 1 : 0;
+        }
+        $params[] = $notes;
+        $stmt->bind_param($types, ...$params);
+        $stmt->execute();
+    }
     echo json_encode(['status' => 'OK', 'message' => 'Ellenőrzési lista mentve.']);
     exit;
 }
 
 // Gyülekezet lista
 $churches = [];
-$c_res = $conn->query("SELECT DISTINCT br.church_id, c.name FROM bank_reconciliation br LEFT JOIN ots.churches c ON br.church_id = c.id WHERE br.church_id > 0 ORDER BY c.name");
+if (is_admin()) {
+    $c_res = $conn->prepare("SELECT DISTINCT br.church_id, c.name FROM bank_reconciliation br LEFT JOIN ots.churches c ON br.church_id = c.id WHERE br.church_id > 0 ORDER BY c.name");
+    if ($c_res) {
+        $c_res->execute();
+        $c_res = $c_res->get_result();
+    }
+} elseif (empty($accessible_church_ids)) {
+    $c_res = false;
+} else {
+    $allowed_ids = array_values(array_filter(array_map('intval', $accessible_church_ids), function ($v) { return $v > 0; }));
+    if (empty($allowed_ids)) {
+        $c_res = false;
+    } else {
+        $placeholders = implode(',', array_fill(0, count($allowed_ids), '?'));
+        $c_sql = "SELECT DISTINCT br.church_id, c.name FROM bank_reconciliation br LEFT JOIN ots.churches c ON br.church_id = c.id WHERE br.church_id IN ($placeholders) ORDER BY c.name";
+        $c_stmt = $conn->prepare($c_sql);
+        if ($c_stmt) {
+            $types = str_repeat('i', count($allowed_ids));
+            $c_stmt->bind_param($types, ...$allowed_ids);
+            $c_stmt->execute();
+            $c_res = $c_stmt->get_result();
+        } else {
+            $c_res = false;
+        }
+    }
+}
 if ($c_res) { while ($c = $c_res->fetch_assoc()) { $churches[] = $c; } }
 
 // Lekérdezés
-$where = ["br.church_id > 0"];
-if ($church_id > 0) { $where[] = 'br.church_id = ' . $church_id; }
-if ($date_from) { $where[] = "br.bank_date >= '$date_from'"; }
-if ($date_to) { $where[] = "br.bank_date <= '$date_to'"; }
-$where_sql = implode(' AND ', $where);
+$clauses = ['br.church_id > 0'];
+$params = [];
+$types = '';
+if ($church_id > 0) {
+    $clauses[] = 'br.church_id = ?';
+    $params[] = $church_id;
+    $types .= 'i';
+} elseif (!is_admin()) {
+    if (empty($accessible_church_ids)) {
+        $clauses[] = '1=0';
+    } else {
+        append_int_in_clause($clauses, $params, $types, 'br.church_id', $accessible_church_ids);
+    }
+}
+if ($date_from) { $clauses[] = 'br.bank_date >= ?'; $params[] = $date_from; $types .= 's'; }
+if ($date_to) { $clauses[] = 'br.bank_date <= ?'; $params[] = $date_to; $types .= 's'; }
+$where_sql = implode(' AND ', $clauses);
 
 $sql = "SELECT br.*, c.name AS church_name,
                ac.id AS audit_id, ac.inspector_name, ac.checked_at,
                ac.cash_voucher_ok, ac.date_filled, ac.amount_ok, ac.description_ok,
                ac.signature_treasurer, ac.signature_receiver, ac.signature_authorizer,
                ac.invoice_ok, ac.tithe_card_ok, ac.receipt_number_ok, ac.decision_number_ok,
-               ac.fund_designation_ok, ac.supporting_doc_ok, ac.notes
+                ac.fund_designation_ok, ac.supporting_doc_ok, ac.bank_in_ots_ok, ac.notes
         FROM bank_reconciliation br
         LEFT JOIN ots.churches c ON br.church_id = c.id
         LEFT JOIN audit_checklist ac ON br.id = ac.bank_reconciliation_id
         WHERE $where_sql
         ORDER BY br.bank_date DESC
         LIMIT 500";
-$result = $conn->query($sql);
+$result = null;
+if (!empty($params)) {
+    $stmt = $conn->prepare($sql);
+    if ($stmt) { $stmt->bind_param($types, ...$params); $stmt->execute(); $result = $stmt->get_result(); }
+} else {
+    $result = $conn->query($sql);
+}
 $rows = [];
 $total_count = 0;
 $checked_count = 0;
@@ -223,7 +277,7 @@ if ($result) {
                     </thead>
                     <tbody>
                         <?php $idx = 1; foreach ($rows as $r): 
-                            $audit_fields = ['cash_voucher_ok','date_filled','amount_ok','description_ok','signature_treasurer','signature_receiver','signature_authorizer','invoice_ok','tithe_card_ok','receipt_number_ok','decision_number_ok','fund_designation_ok','supporting_doc_ok'];
+                            $audit_fields = ['cash_voucher_ok','date_filled','amount_ok','description_ok','signature_treasurer','signature_receiver','signature_authorizer','invoice_ok','tithe_card_ok','receipt_number_ok','decision_number_ok','fund_designation_ok','supporting_doc_ok','bank_in_ots_ok'];
                             $ok_count = 0;
                             $total_audit = count($audit_fields);
                             if ($r['audit_id']) {
@@ -284,6 +338,7 @@ if ($result) {
                                 'description_ok' => 'Megnevezés pontos',
                                 'receipt_number_ok' => 'Bizonylatszám szerepel',
                                 'decision_number_ok' => 'Határozati szám (ha releváns)',
+                                'bank_in_ots_ok' => 'Banki tétel OTS-ben szerepel',
                             ];
                             foreach ($left_items as $key => $label): ?>
                             <div class="checklist-item">
@@ -353,10 +408,10 @@ function openAudit(bankRecId) {
     fetch('document_check_get.php?bank_reconciliation_id=' + bankRecId)
     .then(function(r) { return r.json(); })
     .then(function(data) {
-        document.getElementById('auditBankInfo').innerHTML = '<strong>' + data.church_name + '</strong> &middot; ' + data.bank_date + ' &middot; ' + Number(data.bank_amount).toLocaleString('hu-HU') + ' Ft<br><small>' + (data.bank_desc || '') + '</small>';
+        document.getElementById('auditBankInfo').innerHTML = '<strong>' + data.church_name + '</strong> &middot; ' + data.bank_date + ' &middot; ' + Number(data.bank_amount).toLocaleString('hu-HU') + ' Ft<br><small>' + (data.bank_desc || '') + '</small> &middot; <span class="badge bg-' + (data.status === 'OK' ? 'success' : (data.status === 'UNCHECKED' ? 'secondary' : 'warning')) + '">' + (data.status || 'UNCHECKED') + '</span>';
         
         // Checkboxes beállítása
-        var fields = ['cash_voucher_ok','date_filled','amount_ok','description_ok','signature_treasurer','signature_receiver','signature_authorizer','invoice_ok','tithe_card_ok','receipt_number_ok','decision_number_ok','fund_designation_ok','supporting_doc_ok'];
+        var fields = ['cash_voucher_ok','date_filled','amount_ok','description_ok','signature_treasurer','signature_receiver','signature_authorizer','invoice_ok','tithe_card_ok','receipt_number_ok','decision_number_ok','fund_designation_ok','supporting_doc_ok','bank_in_ots_ok'];
         fields.forEach(function(f) {
             var cb = document.getElementById('chk_' + f);
             if (cb) cb.checked = data.audit && data.audit[f] == 1;

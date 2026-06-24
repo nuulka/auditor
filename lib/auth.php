@@ -53,6 +53,22 @@ function require_church_access($church_id) {
     return true;
 }
 
+function append_int_in_clause(array &$clauses, array &$params, string &$types, string $column, array $values) {
+    $values = array_values(array_filter(array_map('intval', $values), function ($v) {
+        return $v > 0;
+    }));
+    if (empty($values)) {
+        $clauses[] = '1=0';
+        return;
+    }
+    $placeholders = implode(',', array_fill(0, count($values), '?'));
+    $clauses[] = "$column IN ($placeholders)";
+    foreach ($values as $value) {
+        $params[] = $value;
+        $types .= 'i';
+    }
+}
+
 function build_user_context_from_ots() {
     // populate session accessible church ids from ots.ROLES
     if (!isset($_SESSION[GN_USER_ID])) return;

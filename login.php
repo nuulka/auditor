@@ -1,6 +1,16 @@
 <?php
 require_once __DIR__ . '/../ots/constant.php';
 
+if (PHP_SAPI !== 'cli' && !headers_sent()) {
+    session_set_cookie_params([
+        'lifetime' => 0,
+        'path' => '/',
+        'secure' => !empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off',
+        'httponly' => true,
+        'samesite' => 'Lax',
+    ]);
+}
+
 // AJAX session check endpoint — must run before session_destroy
 if (isset($_GET['check'])) {
     header('Content-Type: application/json');
@@ -33,6 +43,7 @@ if ($just_logged_in) {
         if (is_array($acs) && count($acs) === 1) {
             $_SESSION['revizor_selected_church'] = $acs[0];
         }
+        session_regenerate_id(true);
     } catch (Throwable $e) {
         // ignore, fall back to default redirect
     }
