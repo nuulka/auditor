@@ -30,7 +30,7 @@ ensure_revizor_csrf_token();
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>Revizor Asszisztens 1.0 - Nyitó</title>
+    <title>🕵️ Revizor Asszisztens 1.0 - Nyitó</title>
     <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
     <style>
         body { background: #f5f7fb; }
@@ -51,13 +51,16 @@ ensure_revizor_csrf_token();
         </div>
         <div class="d-flex align-items-center gap-1">
             <a href="help.php" class="btn btn-outline-primary btn-sm">❓ Súgó</a>
+            <?php render_dev_toggle(); ?>
+            <?php render_church_badge(); ?>
+            <?php render_user_badge(); ?>
             <a href="logout.php" class="btn btn-outline-danger btn-sm ms-1">Kilépés</a>
         </div>
     </div>
 
     <div class="text-center mb-4">
         <h1 class="display-6 fw-bold">🕵️ Revizor Asszisztens 1.0</h1>
-        <p class="text-muted lead">Bankegyeztető rendszer</p>
+        <p class="text-muted lead">Bankegyeztető és bizonylat ellenőrző rendszer</p>
         <p class="text-muted small">Bejelentkezve: <strong><?php echo htmlspecialchars($_SESSION[GC_USER_FULL_NAME] ?? 'Ismeretlen'); ?></strong></p>
     </div>
 
@@ -150,16 +153,7 @@ ensure_revizor_csrf_token();
         </div>
     </div>
 
-    <div class="text-center mt-5">
-        <a href="reconciliation.php" class="btn btn-primary btn-lg px-5">🏦 Tovább a Bankegyeztetéshez</a>
-    </div>
 
-    <?php if (is_admin()): ?>
-    <div class="text-center mt-4 pt-3 border-top">
-        <a href="database/reset.php" class="text-muted small text-decoration-none">🧹 Adatbázis reset</a>
-    </div>
-    <?php endif; ?>
-</div>
 
 <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
 

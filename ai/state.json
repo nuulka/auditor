@@ -1,17 +1,21 @@
 {
   "project": "Revizor Asszisztens 1.0",
   "status": "active",
-  "last_session": "2026-06-22",
+  "last_session": "2026-06-24",
   "version": "1.0",
   "git_branch": "main",
   "features": {
     "csv_upload": {
       "status": "done",
-      "details": "Multi/single church CSV upload with hash dedup"
+      "details": "Multi/single church CSV upload with hash dedup, accept filter, extension check"
     },
     "progressive_matching": {
       "status": "done",
-      "details": "7 passes (0,3,6,12,35,60 days + text), min score 10 for text pass"
+      "details": "7 passes (0,3,6,12,35,60 days + text), min score 10 for text pass, 30-day sanity gate"
+    },
+    "transfers_to_conference": {
+      "status": "done",
+      "details": "Multi-item grouping by conference_id via bank_reconciliation_items, ABS(?) sign fix, ±45 day window"
     },
     "duplicate_filter": {
       "status": "done",
@@ -23,11 +27,11 @@
     },
     "document_check": {
       "status": "done",
-      "details": "13-point audit checklist, sortable table, localStorage filters"
+      "details": "14-point audit checklist (incl. bank_in_ots_ok), sortable table, localStorage filters, embedded modal in reconciliation.php"
     },
     "transaction_search": {
       "status": "done",
-      "details": "Server-side search with OTS→Bank reverse lookup"
+      "details": "Server-side search with OTS→Bank reverse lookup, aliased count subquery fix"
     },
     "ots_query": {
       "status": "done",
@@ -35,7 +39,19 @@
     },
     "session_management": {
       "status": "done",
-      "details": "20-min Revizor session, AJAX keepalive, popup login with polling"
+      "details": "20-min Revizor session, AJAX keepalive, popup login with polling, session_write_close() for long ops"
+    },
+    "auto_match_modal": {
+      "status": "done",
+      "details": "Progressive/custom/search modes, progress file, timer, church scope, TDZ fix, session lock fix"
+    },
+    "combined_details_modal": {
+      "status": "done",
+      "details": "Parallel bank/OTS view, prev/next navigation, existing match display, aggregation search"
+    },
+    "reconciliation_navbar": {
+      "status": "done",
+      "details": "Two-row layout (title row 1, filter row 2), hamburger menu for actions, responsive"
     }
   },
   "pending_tasks": [],

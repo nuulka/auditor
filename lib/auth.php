@@ -3,6 +3,18 @@ require_once __DIR__ . '/bootstrap.php';
 // OTS constants live outside the revizor directory (../ots). From lib/ we need to go up two levels.
 require_once __DIR__ . '/../../ots/constant.php';
 
+// Dev mode toggle – superadmin can switch between admin and regular user view
+if (isset($_GET['dev_toggle']) && is_superadmin()) {
+    if (!empty($_SESSION['revizor_dev_mode'])) {
+        unset($_SESSION['revizor_dev_mode']);
+    } else {
+        $_SESSION['revizor_dev_mode'] = true;
+    }
+    $redirect = strtok($_SERVER['REQUEST_URI'], '?');
+    header("Location: $redirect");
+    exit;
+}
+
 function require_login() {
     if (!isset($_SESSION[GC_LOGIN_COOKIE])) {
         header('Location: /revizor/login.php');
@@ -11,6 +23,9 @@ function require_login() {
 }
 
 function is_admin() {
+    // Dev mode: superadmin simulates regular user
+    if (!empty($_SESSION['revizor_dev_mode'])) return false;
+    if (is_superadmin()) return true;
     $rights = isset($_SESSION[GN_USER_RIGHTS]) ? intval($_SESSION[GN_USER_RIGHTS]) : 0;
     return ($rights & SDA_L_CONFERENCE_ROLES) != 0;
 }
@@ -18,6 +33,47 @@ function is_admin() {
 function is_revizor() {
     $rights = isset($_SESSION[GN_USER_RIGHTS]) ? intval($_SESSION[GN_USER_RIGHTS]) : 0;
     return ($rights & SDA_L_AUDITOR) != 0;
+}
+
+function is_superadmin() {
+    $cfg = load_app_config();
+    $super_id = isset($cfg['superadmin_user_id']) ? intval($cfg['superadmin_user_id']) : 0;
+    if ($super_id <= 0) return false;
+    $userId = isset($_SESSION[GN_USER_ID]) ? intval($_SESSION[GN_USER_ID]) : 0;
+    return $userId > 0 && $userId === $super_id;
+}
+
+function render_dev_toggle() {
+    if (!is_superadmin()) return;
+    $active = !empty($_SESSION['revizor_dev_mode']);
+    $label = $active ? '👤 Dev: User' : '🛠️ Dev: Admin';
+    $class = $active ? 'btn-outline-warning' : 'btn-outline-secondary';
+    echo '<a href="?dev_toggle=1" class="btn btn-sm ' . $class . '" title="Fejlesztői mód átkapcsolása">' . $label . '</a>';
+}
+
+function get_user_role_label() {
+    if (is_superadmin() && !empty($_SESSION['revizor_dev_mode'])) return '👤 Felhasználó (fejlesztői)';
+    if (is_superadmin()) return '🛠️ Admin / Fejlesztő';
+    if (is_admin()) return '👑 Adminisztrátor';
+    if (is_revizor()) return '🔍 Revizor';
+    return '👤 Felhasználó';
+}
+
+function render_user_badge() {
+    $name = isset($_SESSION[GC_USER_FULL_NAME]) ? $_SESSION[GC_USER_FULL_NAME] : 'Ismeretlen';
+    $role = get_user_role_label();
+    echo '<span class="badge bg-light text-dark border me-1 px-2 py-1" style="font-size:0.8rem;">' . htmlspecialchars($name) . ' – ' . $role . '</span>';
+}
+
+function render_church_badge() {
+    $church_name = $_SESSION['revizor_selected_church_name'] ?? '';
+    $church_id = $_SESSION['revizor_selected_church'] ?? 0;
+    if (empty($church_name) && empty($church_id)) return;
+    if ($church_id <= 0) return;
+    echo '<span class="badge bg-light text-dark border me-1 px-2 py-1" style="font-size:0.8rem;">';
+    echo '🏛 ' . htmlspecialchars($church_name);
+    echo ' <a href="select-church.php?change=1" class="text-decoration-none ms-1" title="Gyülekezet váltása" style="color:inherit;">🔄</a>';
+    echo '</span>';
 }
 
 function get_accessible_church_ids() {

@@ -76,6 +76,81 @@ $resolveFriendlyName = function($acc, $defaultName) use ($church_account_map, $c
     return $defaultName;
 };
 
+// Segédfüggvény a CSV-ben előforduló, esetleg tudományos jelölésben lévő számlaszám feloldásához
+$resolveCsvAccount = function($raw, $church_account_map) {
+    $raw = trim($raw, " \"'");
+    if ($raw === '') return 0;
+
+    // 1. Közvetlen egyezés – szokásos tisztítással (kötőjelek, szóközök eltávolítása)
+    $clean = preg_replace('/[^0-9]/', '', $raw);
+    if (isset($church_account_map[$clean])) return $church_account_map[$clean];
+
+    // 2. Tudományos jelölés: "1,04E+23" vagy "1.04E+23" – string-alapú feldolgozás
+    if (preg_match('/^([0-9.,]+)E[+-]\d+$/i', $raw, $m)) {
+        $num = str_replace(',', '.', $m[1]); // "1.04"
+        if (preg_match('/^(\d*)\.?(\d*)$/', $num, $n)) {
+            $combined = $n[1] . $n[2];
+            $dec_cnt = strlen($n[2]);
+            $exp = (int)substr($raw, strpos(strtoupper($raw), 'E') + 1);
+            $zeros = $exp - $dec_cnt;
+            if ($zeros >= 0) {
+                $full = $combined . str_repeat('0', $zeros);
+                if (isset($church_account_map[$full])) return $church_account_map[$full];
+            }
+        }
+    }
+
+    // 3. "104003000000000000000000,00" – vesszős decimális, integer rész kell
+    if (preg_match('/^(\d+),\d+$/', $raw, $m)) {
+        $int_part = $m[1];
+        if (isset($church_account_map[$int_part])) return $church_account_map[$int_part];
+    }
+
+    // 4. Visszafejtés: ismert számlák float reprezentációjával próbálunk egyezni
+    //    Pl. ha a CSV-ben "104003000000000000000000,00" van, de a valós számla
+    //    "104003395049575053561009", akkor float-on keresztül ugyanazt a torzított
+    //    értéket kapjuk.
+    $raw_digits = $clean;
+    $raw_digits_short = mb_substr($raw_digits, 0, 20); // első 20 jegy elegendő az összehasonlításhoz
+    foreach ($church_account_map as $known => $cid) {
+        $float_val = (float)$known;
+        // Teljes számként
+        $as_full = sprintf('%.0f', $float_val);
+        if ($as_full === $raw_digits) return $cid;
+        // Vesszős decimálissal
+        if ($as_full . ',00' === $raw) return $cid;
+        // Rövidített összehasonlítás (első 20 jegy)
+        if (mb_substr($as_full, 0, 20) === $raw_digits_short) return $cid;
+        // Tudományos jelölés, több pontossági szinttel
+        $upper_raw = strtoupper($raw);
+        for ($prec = 2; $prec <= 10; $prec++) {
+            $sci = sprintf("%.{$prec}E", $float_val);
+            if ($sci === $upper_raw) return $cid;
+            $sci_hu = str_replace('.', ',', $sci);
+            if ($sci_hu === $upper_raw) return $cid;
+        }
+    }
+
+    return 0;
+};
+
+$validateAccountNumbers = function($rows_data) {
+    $invalid_rows = [];
+    foreach ($rows_data as $idx => $rd) {
+        $acc = isset($rd['acc']) ? preg_replace('/[^0-9]/', '', $rd['acc']) : '';
+        if (strlen($acc) < 8) {
+            $invalid_rows[] = [
+                'line' => $rd['line'] ?? ($idx + 1),
+                'raw' => $rd['raw_acc'] ?? '',
+                'digits' => strlen($acc),
+                'date' => $rd['date'] ?? '',
+                'amount' => $rd['amount'] ?? ''
+            ];
+        }
+    }
+    return $invalid_rows;
+};
+
 // OTS Kiadás típusok meghatározása (az előjel helyes számításához)
 $exp_types = [];
 @include_once(__DIR__ . "/../constant.php");
@@ -136,6 +211,22 @@ $conn->query("CREATE TABLE IF NOT EXISTS bank_reconciliation_items (
     FOREIGN KEY (reconciliation_id) REFERENCES bank_reconciliation(id) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4");
 
+$conn->query("CREATE TABLE IF NOT EXISTS upload_log (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    filename VARCHAR(255) NOT NULL,
+    file_size INT DEFAULT 0,
+    row_count INT DEFAULT 0,
+    matched_count INT DEFAULT 0,
+    skipped_count INT DEFAULT 0,
+    duplicate_count INT DEFAULT 0,
+    church_id INT DEFAULT NULL,
+    church_name VARCHAR(255) DEFAULT NULL,
+    uploaded_by VARCHAR(100) DEFAULT NULL,
+    upload_type VARCHAR(20) DEFAULT 'single' COMMENT 'single or multi',
+    warning TEXT DEFAULT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4");
+
 function insert_ots_items($conn, $reconciliation_id, $record_id, $church_id, $exp_types, $extra_where = '') {
     $w = trim($extra_where);
     $w_clause = ($w !== '') ? " AND $w" : '';
@@ -173,8 +264,16 @@ function insert_ots_items($conn, $reconciliation_id, $record_id, $church_id, $ex
 }
 
 $message = "";
+if (isset($_GET['clear_msg'])) {
+    unset($_SESSION['last_upload_msg']);
+}
+if ($_SERVER['REQUEST_METHOD'] !== 'POST' && !empty($_SESSION['last_upload_msg'])) {
+    $message = $_SESSION['last_upload_msg'];
+}
+
 if (isset($_GET['saved']) && $_GET['saved'] === 'skip') {
     $message = "<div class='alert alert-success'>✅ Figyelmen kívül hagyás beállítások mentve.</div>";
+    unset($_SESSION['last_upload_msg']);
 }
 
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
@@ -242,6 +341,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $header = array_map(function($val) { return trim($val, " \t\n\r\0\x0B\""); }, $header);
             
             $idx_date = array_search('Értéknap', $header);
+            $idx_stmt_date = array_search('Kivonat dátuma', $header);
             $idx_amount = array_search('Összeg', $header);
             $idx_desc = array_search('Közlemény', $header);
             $idx_partner_name = array_search('Kedvezményezett neve', $header);
@@ -249,10 +349,60 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $idx_init_name = array_search('Kezdeményező neve', $header);
             $idx_init_acc = array_search('Kezdeményező számlaszáma', $header);
             $idx_tx_id = array_search('Tranzakcióazonosító', $header);
+            $idx_tx_code = array_search('Tranzakciós kód', $header);
+            $idx_tx_code_iso = array_search('Tranzakciós kód (ISO)', $header);
 
             if ($idx_date === FALSE || $idx_amount === FALSE) {
                 $message = "<div class='alert alert-danger'>Hiba: Hibás fájlstruktúra!</div>";
             } else {
+                // --- Számlaszám-ellenőrzés a feltöltés előtt ---
+                $force = isset($_POST['force_upload']) && $_POST['force_upload'] === '1';
+                $invalid_accounts = [];
+                for ($i = 1; $i < count($lines); $i++) {
+                    if (empty(trim($lines[$i]))) continue;
+                    $row = str_getcsv($lines[$i], $separator);
+                    if (!isset($row[$idx_date]) || empty(trim($row[$idx_date]))) continue;
+                    $raw_amount = str_replace([' ', "\xA0", 'Ft', 'HUF'], '', trim($row[$idx_amount] ?? '', " \""));
+                    $amount = floatval(str_replace(',', '.', $raw_amount));
+                    $is_incoming = ($amount > 0);
+                    $init_acc_raw = trim($row[$idx_init_acc] ?? '', " \"'");
+                    $ben_acc_raw = trim($row[$idx_partner_acc] ?? '', " \"'");
+                    $p_acc = $is_incoming ? $init_acc_raw : $ben_acc_raw;
+                    $clean = preg_replace('/[^0-9]/', '', $p_acc);
+                    if (strlen($clean) > 0 && strlen($clean) < 8) {
+                        $invalid_accounts[] = [
+                            'line' => $i,
+                            'raw' => mb_substr($p_acc, 0, 40),
+                            'digits' => strlen($clean),
+                            'date' => trim($row[$idx_date], " \""),
+                            'amount' => number_format($amount, 0, ',', ' ')
+                        ];
+                    }
+                }
+                $bad_ratio = count($invalid_accounts) / max(1, count($lines) - 1);
+                if ($bad_ratio > 0.3 && !$force) {
+                    $bad_list = '';
+                    foreach (array_slice($invalid_accounts, 0, 20) as $inv) {
+                        $bad_list .= "{$inv['line']}. sor: '{$inv['raw']}' ({$inv['digits']} számjegy), {$inv['date']}, {$inv['amount']} Ft<br>";
+                    }
+                    if (count($invalid_accounts) > 20) {
+                        $bad_list .= '... és további ' . (count($invalid_accounts) - 20) . ' sor<br>';
+                    }
+                    $message = "<div class='alert alert-warning'><strong>⚠️ Figyelmeztetés: érvénytelen bankszámlaszámok</strong><br>
+                        A CSV fájlban <strong>" . count($invalid_accounts) . "</strong> sorban (" . round($bad_ratio*100) . "%) a bankszámlaszám 8 számjegynél rövidebb.<br>
+                        Ilyen adatokkal a párosító funkció nem működik megfelelően.<br><br>
+                        <strong>Érvénytelen számlaszámok (első 20):</strong><br>$bad_list<br>
+                        <form method='POST' enctype='multipart/form-data' style='display:inline'>
+                            <input type='hidden' name='csrf_token' value='" . htmlspecialchars($_SESSION['csrf_token']) . "'>
+                            <input type='hidden' name='single_upload' value='1'>
+                            <input type='hidden' name='church_search' value='" . htmlspecialchars($church_input) . "'>
+                            <input type='hidden' name='force_upload' value='1'>
+                            <input type='hidden' name='MAX_FILE_SIZE' value='" . (50*1024*1024) . "'>
+                            <button type='submit' class='btn btn-warning'>Mégis feltöltöm</button>
+                        </form>
+                        <a href='upload.php' class='btn btn-secondary'>Mégse</a>
+                    </div>";
+                } else {
                 $inserted_rows = 0;
                 $skipped_rows = 0;
                 $auto_matched = 0;
@@ -270,6 +420,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                         $bank_date = (preg_match('/^\d{8}$/', $raw_date)) 
                             ? substr($raw_date, 0, 4) . '-' . substr($raw_date, 4, 2) . '-' . substr($raw_date, 6, 2)
                             : date('Y-m-d', strtotime(str_replace(['.', '/'], '-', rtrim($raw_date, '.'))));
+                        $raw_stmt_date = isset($row[$idx_stmt_date]) ? trim($row[$idx_stmt_date], " \"") : '';
+                        $bank_stmt_date = (preg_match('/^\d{8}$/', $raw_stmt_date))
+                            ? substr($raw_stmt_date, 0, 4) . '-' . substr($raw_stmt_date, 4, 2) . '-' . substr($raw_stmt_date, 6, 2)
+                            : (!empty($raw_stmt_date) ? date('Y-m-d', strtotime(str_replace(['.', '/'], '-', rtrim($raw_stmt_date, '.')))) : '');
 
                         $clean_amount = str_replace([' ', "\xA0", 'Ft', 'HUF'], '', trim($row[$idx_amount], " \""));
                         $bank_amount = floatval(str_replace(',', '.', $clean_amount));
@@ -305,8 +459,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                         $bank_ext_acc = $p_acc;
                         $bank_ext_ref = isset($row[$idx_tx_id]) ? trim($row[$idx_tx_id], " \"") : '';
                         if (strpos(strtoupper($bank_ext_ref), 'E+') !== FALSE) { $bank_ext_ref = sprintf("%.0f", floatval(str_replace(',', '.', $bank_ext_ref))); }
+                        $bank_tx_code = isset($row[$idx_tx_code]) ? trim($row[$idx_tx_code], " \"") : '';
+                        $bank_tx_code_iso = isset($row[$idx_tx_code_iso]) ? trim($row[$idx_tx_code_iso], " \"") : '';
 
-                        $base_fingerprint = $church_id . '_' . $bank_date . '_' . $bank_amount . '_' . $bank_desc . '_' . $bank_ext_acc;
+                        $base_fingerprint = $church_id . '_' . $bank_date . '_' . $bank_amount . '_' . $bank_desc . '_' . $bank_ext_acc . '_' . $bank_ext_ref . '_' . $bank_tx_code . '_' . $bank_tx_code_iso . '_' . $bank_stmt_date;
                         $row_hash = md5($base_fingerprint);
 
                         try {
@@ -390,6 +546,13 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                         // --- AUTO-MATCH VÉGE ---
                     }
                     $conn->commit();
+                    $church_name = isset($church_names[$church_id]) ? $church_names[$church_id] : '';
+                    $ul_stmt = $conn->prepare("INSERT INTO upload_log (filename, file_size, row_count, matched_count, skipped_count, duplicate_count, church_id, church_name, uploaded_by, upload_type) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'single')");
+                    if ($ul_stmt) {
+                        $fname = $file['name']; $fsize = $file['size'];
+                        $ul_stmt->bind_param("siiiiisss", $fname, $fsize, $inserted_rows, $auto_matched, $skipped_rows, $duplicate_count, $church_id, $church_name, $_SESSION[GC_USER_FULL_NAME]);
+                        $ul_stmt->execute();
+                    }
                     $message = "<div class='alert alert-success'>Beolvasva: <strong>$inserted_rows</strong>, Átugorva: <strong>$skipped_rows</strong> (Duplikált: $duplicate_count) tétel. Automatikusan párosítva (OK): <strong>$auto_matched</strong>.</div>";
                 } catch (Exception $e) {
                     $conn->rollback();
@@ -397,6 +560,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 }
             }
         }
+    }
     }
     }
     }
@@ -417,13 +581,16 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 $header = array_map(function($val) { return trim($val, " \t\n\r\0\x0B\""); }, $header);
                 
                 $idx_date = array_search('Értéknap', $header);
+                $idx_stmt_date = array_search('Kivonat dátuma', $header);
                 $idx_amount = array_search('Összeg', $header);
                 $idx_desc = array_search('Közlemény', $header);
                 $idx_partner_name = array_search('Kedvezményezett neve', $header);
                 $idx_partner_acc = array_search('Kedvezményezett számlaszáma', $header);
                 $idx_init_name = array_search('Kezdeményező neve', $header);
                 $idx_init_acc = array_search('Kezdeményező számlaszáma', $header);
-                $idx_tx_id = array_search('Tranzakcióazonosító', $header);
+    $idx_tx_id = array_search('Tranzakcióazonosító', $header);
+    $idx_tx_code = array_search('Tranzakciós kód', $header);
+    $idx_tx_code_iso = array_search('Tranzakciós kód (ISO)', $header);
                 $idx_own_acc = array_search('Számlaszám', $header); // K&H specifikus saját számla
 
                 if ($idx_date === FALSE || $idx_amount === FALSE) {
@@ -441,6 +608,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                             $bank_date = (preg_match('/^\d{8}$/', $raw_date)) 
                                 ? substr($raw_date, 0, 4) . '-' . substr($raw_date, 4, 2) . '-' . substr($raw_date, 6, 2)
                                 : date('Y-m-d', strtotime(str_replace(['.', '/'], '-', rtrim($raw_date, '.'))));
+                            $raw_stmt_date = isset($row[$idx_stmt_date]) ? trim($row[$idx_stmt_date], " \"") : '';
+                            $bank_stmt_date = (preg_match('/^\d{8}$/', $raw_stmt_date))
+                                ? substr($raw_stmt_date, 0, 4) . '-' . substr($raw_stmt_date, 4, 2) . '-' . substr($raw_stmt_date, 6, 2)
+                                : (!empty($raw_stmt_date) ? date('Y-m-d', strtotime(str_replace(['.', '/'], '-', rtrim($raw_stmt_date, '.')))) : '');
 
                             $bank_amount = floatval(str_replace(',', '.', str_replace([' ', "\xA0", 'Ft'], '', $row[$idx_amount])));
 
@@ -449,18 +620,21 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                             // Számlaszámok kinyerése
                             $init_acc_raw = trim($row[$idx_init_acc] ?? '', " \"'");
                             $ben_acc_raw = trim($row[$idx_partner_acc] ?? '', " \"'");
+                            $init_acc_raw_original = $init_acc_raw;
+                            $ben_acc_raw_original = $ben_acc_raw;
                             if (strpos(strtoupper($init_acc_raw), 'E+') !== FALSE) { $init_acc_raw = sprintf("%.0f", floatval(str_replace(',', '.', $init_acc_raw))); }
                             if (strpos(strtoupper($ben_acc_raw), 'E+') !== FALSE) { $ben_acc_raw = sprintf("%.0f", floatval(str_replace(',', '.', $ben_acc_raw))); }
 
-                            $lookup_acc_raw = $is_incoming ? $ben_acc_raw : $init_acc_raw;
+                            $lookup_acc_raw = $is_incoming ? $ben_acc_raw_original : $init_acc_raw_original;
 
                             $clean_lookup_acc = preg_replace('/[^0-9]/', '', $lookup_acc_raw);
-                            $church_id = $church_account_map[$clean_lookup_acc] ?? 0;
+                            $church_id = $resolveCsvAccount($lookup_acc_raw, $church_account_map);
 
                             // Ha az irányított keresés nem talált gyülekezetet, próbálkozzunk a saját számla oszloppal is
                             if ($church_id === 0 && $idx_own_acc !== FALSE) {
-                                $own_acc = preg_replace('/[^0-9]/', '', $row[$idx_own_acc] ?? '');
-                                $church_id = $church_account_map[$own_acc] ?? 0;
+                                $own_acc_raw = $row[$idx_own_acc] ?? '';
+                                $own_acc = preg_replace('/[^0-9]/', '', $own_acc_raw);
+                                $church_id = $resolveCsvAccount($own_acc_raw, $church_account_map);
                             }
 
                             if ($church_id === 0) { continue; }
@@ -480,8 +654,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                             $bank_ext_acc = $p_acc;
                             $bank_ext_ref = ($idx_tx_id !== FALSE) ? trim($row[$idx_tx_id] ?? '', " \"") : '';
                             if (strpos(strtoupper($bank_ext_ref), 'E+') !== FALSE) { $bank_ext_ref = sprintf("%.0f", floatval(str_replace(',', '.', $bank_ext_ref))); }
+                            $bank_tx_code = ($idx_tx_code !== FALSE) ? trim($row[$idx_tx_code] ?? '', " \"") : '';
+                            $bank_tx_code_iso = ($idx_tx_code_iso !== FALSE) ? trim($row[$idx_tx_code_iso] ?? '', " \"") : '';
 
-                            $base_fingerprint = $church_id . '_' . $bank_date . '_' . $bank_amount . '_' . $bank_desc . '_' . $bank_ext_acc;
+            $base_fingerprint = $church_id . '_' . $bank_date . '_' . $bank_amount . '_' . $bank_desc . '_' . $bank_ext_acc . '_' . $bank_ext_ref . '_' . $bank_tx_code . '_' . $bank_tx_code_iso . '_' . $bank_stmt_date;
                             $row_hash = md5($base_fingerprint);
 
                             try {
@@ -523,6 +699,13 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                             }
                         }
                         $conn->commit();
+                        $ul_stmt = $conn->prepare("INSERT INTO upload_log (filename, file_size, row_count, matched_count, skipped_count, duplicate_count, uploaded_by, upload_type, warning) VALUES (?, ?, ?, ?, ?, ?, ?, 'multi', ?)");
+                        if ($ul_stmt) {
+                            $fname = $file['name']; $fsize = $file['size'];
+                            $mul_warn = '';
+                            $ul_stmt->bind_param("siiiiiss", $fname, $fsize, $inserted_rows, $auto_matched, $skipped_rows, $duplicate_count, $_SESSION[GC_USER_FULL_NAME], $mul_warn);
+                            $ul_stmt->execute();
+                        }
                         $message = "<div class='alert alert-success'>Többes feltöltés kész. Beolvasva: <strong>$inserted_rows</strong> tétel.<br><small>Már korábban feltöltött (duplikált): $duplicate_count.</small></div>";
                     } catch (Exception $e) {
                         $conn->rollback();
@@ -534,6 +717,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     }
     }
     } // CSRF else block vége
+}
+
+// Save last upload result to session so it survives page refresh
+if (!empty($message)) {
+    $_SESSION['last_upload_msg'] = $message;
 }
 
 //
@@ -574,6 +762,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['
     $header = str_getcsv(trim($lines[0]), $separator);
     $header = array_map(function($v) { return trim($v, " \t\n\r\0\x0B\""); }, $header);
     $idx_date = array_search('Értéknap', $header);
+    $idx_stmt_date = array_search('Kivonat dátuma', $header);
     $idx_amount = array_search('Összeg', $header);
     $idx_desc = array_search('Közlemény', $header);
     $idx_partner_name = array_search('Kedvezményezett neve', $header);
@@ -581,6 +770,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['
     $idx_init_name = array_search('Kezdeményező neve', $header);
     $idx_init_acc = array_search('Kezdeményező számlaszáma', $header);
     $idx_tx_id = array_search('Tranzakcióazonosító', $header);
+    $idx_tx_code = array_search('Tranzakciós kód', $header);
+    $idx_tx_code_iso = array_search('Tranzakciós kód (ISO)', $header);
     $idx_own_acc = array_search('Számlaszám', $header);
     if ($idx_date === FALSE || $idx_amount === FALSE) {
         echo json_encode(['status' => 'ERROR', 'message' => 'Hibás fájlstruktúra']);
@@ -599,20 +790,28 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['
             $bank_date = (preg_match('/^\d{8}$/', $raw_date))
                 ? substr($raw_date, 0, 4) . '-' . substr($raw_date, 4, 2) . '-' . substr($raw_date, 6, 2)
                 : date('Y-m-d', strtotime(str_replace(['.', '/'], '-', rtrim($raw_date, '.'))));
+            $raw_stmt_date = isset($row[$idx_stmt_date]) ? trim($row[$idx_stmt_date], " \"") : '';
+            $bank_stmt_date = (preg_match('/^\d{8}$/', $raw_stmt_date))
+                ? substr($raw_stmt_date, 0, 4) . '-' . substr($raw_stmt_date, 4, 2) . '-' . substr($raw_stmt_date, 6, 2)
+                : (!empty($raw_stmt_date) ? date('Y-m-d', strtotime(str_replace(['.', '/'], '-', rtrim($raw_stmt_date, '.')))) : '');
             $bank_amount = floatval(str_replace(',', '.', str_replace([' ', "\xA0", 'Ft'], '', $row[$idx_amount])));
             $is_incoming = ($bank_amount > 0);
             $init_acc_raw = trim($row[$idx_init_acc] ?? '', " \"'");
             $ben_acc_raw = trim($row[$idx_partner_acc] ?? '', " \"'");
+            // Nyers értékek mentése a CSV-számla feloldáshoz (a float konverzió előtt)
+            $init_acc_raw_original = $init_acc_raw;
+            $ben_acc_raw_original = $ben_acc_raw;
             if (strpos(strtoupper($init_acc_raw), 'E+') !== FALSE) { $init_acc_raw = sprintf("%.0f", floatval(str_replace(',', '.', $init_acc_raw))); }
             if (strpos(strtoupper($ben_acc_raw), 'E+') !== FALSE) { $ben_acc_raw = sprintf("%.0f", floatval(str_replace(',', '.', $ben_acc_raw))); }
-            $lookup_acc_raw = $is_incoming ? $ben_acc_raw : $init_acc_raw;
+            $lookup_acc_raw = $is_incoming ? $ben_acc_raw_original : $init_acc_raw_original;
             $clean_lookup_acc = preg_replace('/[^0-9]/', '', $lookup_acc_raw);
-            $church_id = $church_account_map[$clean_lookup_acc] ?? 0;
+            $church_id = $resolveCsvAccount($lookup_acc_raw, $church_account_map);
             $own_acc = '';
             if ($idx_own_acc !== FALSE) {
-                $own_acc = preg_replace('/[^0-9]/', '', $row[$idx_own_acc] ?? '');
+                $own_acc_raw = $row[$idx_own_acc] ?? '';
+                $own_acc = preg_replace('/[^0-9]/', '', $own_acc_raw);
                 if ($church_id === 0) {
-                    $church_id = $church_account_map[$own_acc] ?? 0;
+                    $church_id = $resolveCsvAccount($own_acc_raw, $church_account_map);
                 }
             }
             $is_config_skip = (!empty($clean_lookup_acc) && isset($skip_account_map[$clean_lookup_acc])) || (!empty($own_acc) && isset($skip_account_map[$own_acc]));
@@ -622,6 +821,15 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['
                 continue;
             }
             if ($church_id === 0) {
+                if ($skipped_unmapped < 3) {
+                    $col_count = count($row);
+                    $raw_own = $row[$idx_own_acc] ?? 'N/A';
+                    $raw_ben = $row[$idx_partner_acc] ?? 'N/A';
+                    $raw_init = $row[$idx_init_acc] ?? 'N/A';
+                    $log_line = "ROW=" . ($i+1) . " cols=$col_count amount={$row[$idx_amount]} incoming=" . ($is_incoming?'1':'0');
+                    $log_line .= " szamlaszam=[$raw_own] ben=[$raw_ben] init=[$raw_init]";
+                    error_log("[REVIZOR_DEBUG] $log_line");
+                }
                 $skipped++;
                 $skipped_unmapped++;
                 continue;
@@ -636,7 +844,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['
             $bank_ext_acc = $p_acc;
             $bank_ext_ref = ($idx_tx_id !== FALSE) ? trim($row[$idx_tx_id] ?? '', " \"") : '';
             if (strpos(strtoupper($bank_ext_ref), 'E+') !== FALSE) { $bank_ext_ref = sprintf("%.0f", floatval(str_replace(',', '.', $bank_ext_ref))); }
-            $base_fingerprint = $church_id . '_' . $bank_date . '_' . $bank_amount . '_' . $bank_desc . '_' . $bank_ext_acc;
+            $bank_tx_code = ($idx_tx_code !== FALSE) ? trim($row[$idx_tx_code] ?? '', " \"") : '';
+            $bank_tx_code_iso = ($idx_tx_code_iso !== FALSE) ? trim($row[$idx_tx_code_iso] ?? '', " \"") : '';
+            $base_fingerprint = $church_id . '_' . $bank_date . '_' . $bank_amount . '_' . $bank_desc . '_' . $bank_ext_acc . '_' . $bank_ext_ref . '_' . $bank_tx_code . '_' . $bank_tx_code_iso . '_' . $bank_stmt_date;
             $row_hash = md5($base_fingerprint);
             try {
                 $stmt = $conn->prepare("INSERT INTO bank_reconciliation (row_hash, church_id, bank_date, bank_amount, bank_desc, bank_ext_acc, bank_ext_name, bank_ext_ref, status, bank_init_name, bank_init_acc, bank_ben_name, bank_ben_acc) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'UNCHECKED', ?, ?, ?, ?)");
@@ -646,12 +856,24 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['
             } catch (mysqli_sql_exception $e) {
                 if ($e->getCode() === 1062) {
                     $skipped++; $duplicate++;
-                    $dup_date = $bank_date;
-                    $dup_amount = number_format(abs($bank_amount), 0, ',', ' ') . ' Ft';
-                    $dup_desc = mb_substr($bank_desc, 0, 40);
-                    $dup_key = "$dup_date $dup_amount $dup_desc";
-                    if (!isset($dup_details[$dup_key])) { $dup_details[$dup_key] = 0; }
-                    $dup_details[$dup_key]++;
+                    $dup_line = $i + 1;
+                    // lekérjük a meglévő rekordot az adatbázisból
+                    $existing = null;
+                    $eq = $conn->prepare("SELECT bank_date, bank_amount, bank_desc, bank_ext_acc, bank_ext_name, bank_ext_ref, bank_init_name, bank_init_acc, bank_ben_name, bank_ben_acc FROM bank_reconciliation WHERE row_hash = ? LIMIT 1");
+                    if ($eq) { $eq->bind_param('s', $row_hash); $eq->execute(); $er = $eq->get_result(); if ($er) $existing = $er->fetch_assoc(); }
+                    $incoming = [
+                        'bank_date' => $bank_date,
+                        'bank_amount' => $bank_amount,
+                        'bank_desc' => $bank_desc,
+                        'bank_ext_acc' => $bank_ext_acc,
+                        'bank_ext_name' => $bank_ext_name,
+                        'bank_ext_ref' => $bank_ext_ref,
+                        'bank_init_name' => $init_name_raw,
+                        'bank_init_acc' => $init_acc_raw,
+                        'bank_ben_name' => $ben_name_raw,
+                        'bank_ben_acc' => $ben_acc_raw,
+                    ];
+                    $dup_details[] = ['line' => $dup_line, 'incoming' => $incoming, 'existing' => $existing];
                     continue;
                 }
                 throw $e;
@@ -659,10 +881,22 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['
         }
         $conn->commit();
         $elapsed = round(microtime(true) - $start_upload, 2);
-        $dup_list = [];
-        arsort($dup_details);
-        foreach ($dup_details as $desc => $cnt) {
-            $dup_list[] = "$desc ($cnt db)";
+            $ul_stmt = $conn->prepare("INSERT INTO upload_log (filename, file_size, row_count, matched_count, skipped_count, duplicate_count, uploaded_by, upload_type, warning) VALUES (?, ?, ?, ?, ?, ?, ?, 'multi_ajax', ?)");
+        if ($ul_stmt) {
+            $fname = $file['name'];
+            $fsize = $file['size'];
+            $matched_ajax = 0;
+            $mul_warn = '';
+            if ($skipped_config > 0 && $skipped_unmapped > 0) {
+                $mul_warn = 'Config: ' . $skipped_config . ', unmapped: ' . $skipped_unmapped;
+            } elseif ($skipped_config > 0) {
+                $mul_warn = 'Config skip: ' . $skipped_config;
+            } elseif ($skipped_unmapped > 0) {
+                $mul_warn = 'Unmapped accounts: ' . $skipped_unmapped;
+            }
+            $ul_user = $_SESSION[GC_USER_FULL_NAME] ?? '';
+            $ul_stmt->bind_param("siiiiiss", $fname, $fsize, $inserted, $matched_ajax, $skipped, $duplicate, $ul_user, $mul_warn);
+            $ul_stmt->execute();
         }
         echo json_encode([
             'status' => 'OK',
@@ -672,7 +906,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['
             'skipped_config' => $skipped_config,
             'skipped_unmapped' => $skipped_unmapped,
             'time_sec' => $elapsed,
-            'dup_details' => $dup_list
+            'dup_details' => $dup_details
         ]);
     } catch (Exception $e) {
         $conn->rollback();
@@ -870,7 +1104,15 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['
     // final progress write and remove file after small delay
     @file_put_contents($progress_file, json_encode(['status'=>'DONE','matched'=>$matched,'total_unchecked'=>$total_unchecked,'current_church'=>null,'processed_churches'=>isset($processed_churches)?$processed_churches:0,'processed_records'=>isset($processed_records)?$processed_records:0,'time_sec'=>$elapsed]));
     // give client the final result
-    echo json_encode(['status' => 'OK', 'pass_name' => $pass_names[$pass_index], 'matched' => $matched, 'total_unchecked' => $total_unchecked, 'time_sec' => $elapsed]);
+    $response = ['status' => 'OK', 'pass_name' => $pass_names[$pass_index], 'matched' => $matched, 'total_unchecked' => $total_unchecked, 'time_sec' => $elapsed];
+    // Include overall summary stats after the last pass
+    if ($pass_index >= 6) {
+        $summary_stmt = $conn->query("SELECT COUNT(*) AS total, SUM(status = 'OK') AS ok_count, SUM(status = 'CSUSZAS') AS csuszas_count, SUM(status = 'UNCHECKED') AS unchecked_count FROM bank_reconciliation");
+        if ($summary_stmt) {
+            $response['summary'] = $summary_stmt->fetch_assoc();
+        }
+    }
+    echo json_encode($response);
     // cleanup progress file after short time (client will poll once more)
     register_shutdown_function(function() use ($progress_file){ if (file_exists($progress_file)) @unlink($progress_file); });
     exit;
@@ -884,11 +1126,12 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['
 <html lang="hu">
 <head>
     <meta charset="UTF-8">
-    <title>Revizor Asszisztens 1.0 – Feltöltés</title>
+    <title>🕵️ Revizor Asszisztens 1.0 – Feltöltés</title>
     <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
     <style>
         body { background-color: #f8f9fa; padding: 40px; }
         .upload-card { max-width: 600px; margin: 0 auto; background: white; padding: 30px; border-radius: 8px; box-shadow: 0 4px 6px rgba(0,0,0,0.05); }
+        .accordion-wrapper { max-width: 700px; margin: 0 auto; }
         /* Loading overlay */
         #loadingOverlay {
             display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%;
@@ -957,12 +1200,39 @@ document.addEventListener('DOMContentLoaded', function() {
             }
             var dupDetailHtml = '';
             if (result.duplicate > 0) {
-                dupDetailHtml = '<div class="small text-muted mt-1">Duplikált (már az adatbázisban volt): <strong>' + result.duplicate + ' db</strong></div>';
+                dupDetailHtml = '<div class="small text-muted mt-1">Duplikált (már az adatbázisban volt): <strong>' + result.duplicate + ' db</strong>';
+                if (result.dup_details && result.dup_details.length > 0) {
+                    dupDetailHtml += '<div class="mt-1" style="font-size:11px;max-height:300px;overflow-y:auto;">';
+                    for (var d = 0; d < result.dup_details.length; d++) {
+                        var dd = result.dup_details[d];
+                        var inc = dd.incoming || {};
+                        var ex = dd.existing || {};
+                        dupDetailHtml += '<div class="border-bottom pb-1 mb-1"><strong>CSV sor #' + dd.line + '</strong>';
+                        dupDetailHtml += '<table class="table table-sm table-borderless mb-0" style="font-size:11px;"><tr><th style="width:80px;">Mező</th><th>CSV (új)</th><th>Adatbázis (meglévő)</th></tr>';
+                        var fields = [
+                            {k:'bank_date',l:'Dátum'},{k:'bank_amount',l:'Összeg'},{k:'bank_desc',l:'Közlemény'},
+                            {k:'bank_ext_name',l:'Partner név'},{k:'bank_ext_acc',l:'Partner számla'},
+                            {k:'bank_ext_ref',l:'Azonosító'},{k:'bank_init_name',l:'Kezd. név'},
+                            {k:'bank_init_acc',l:'Kezd. számla'},{k:'bank_ben_name',l:'Kedv. név'},
+                            {k:'bank_ben_acc',l:'Kedv. számla'}
+                        ];
+                        for (var f = 0; f < fields.length; f++) {
+                            var fk = fields[f].k, fl = fields[f].l;
+                            var iv = inc[fk] !== undefined ? inc[fk] : '';
+                            var ev = ex[fk] !== undefined ? ex[fk] : '';
+                            if (fk === 'bank_amount') { iv = Number(iv).toLocaleString('hu-HU', {minimumFractionDigits:0}) + ' Ft'; ev = ev ? Number(ev).toLocaleString('hu-HU', {minimumFractionDigits:0}) + ' Ft' : ''; }
+                            dupDetailHtml += '<tr><td class="text-muted">' + fl + '</td><td>' + (iv+'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;') + '</td><td>' + (ev+'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;') + '</td></tr>';
+                        }
+                        dupDetailHtml += '</table></div>';
+                    }
+                    dupDetailHtml += '</div>';
+                }
+                dupDetailHtml += '</div>';
             }
             panel.innerHTML = '<div class="alert alert-success mb-2">✅ Feltöltve: <strong>' + result.inserted + '</strong> sor' + skipInfo + ' — <strong>' + result.time_sec + ' mp</strong>' + skipSummaryHtml + dupDetailHtml + '</div>';
 
             if (result.inserted > 0) {
-                panel.innerHTML += '<div class="text-center py-2"><div class="spinner-border spinner-border-sm text-info me-2"></div>Automatikus párosítás indítása...</div>';
+                panel.innerHTML += '<div class="text-center py-2" id="autoMatchStatus"><div class="spinner-border spinner-border-sm text-info me-2"></div>Automatikus párosítás indítása...</div>';
                 return runProgressiveMatch();
             } else {
                 panel.innerHTML += '<div class="alert alert-info text-center py-2 mb-0">ℹ️ Nincs új tétel, automatikus párosítás nem szükséges.</div>';
@@ -977,6 +1247,9 @@ document.addEventListener('DOMContentLoaded', function() {
     function runProgressiveMatch() {
         var panel = document.getElementById('progressPanel');
         var passNames = ['0 napos', '3 napos', '6 napos', '12 napos', '35 napos', '60 napos', 'Szöveges'];
+        // Mutassuk, hogy már nem "indítás" hanem "folyamatban"
+        var statusDiv = document.getElementById('autoMatchStatus');
+        if (statusDiv) statusDiv.innerHTML = '<div class="spinner-border spinner-border-sm text-info me-2"></div>Automatikus párosítás folyamatban...</div>';
         var totalMatched = 0;
         var passIndex = 0;
         var initialTotal = 0;
@@ -995,6 +1268,21 @@ document.addEventListener('DOMContentLoaded', function() {
                 document.getElementById('progressBar').style.width = '100%';
                 document.getElementById('progressBar').classList.replace('progress-bar-animated', 'bg-success');
                 document.getElementById('progressStats').innerHTML = '✅ Kész — <strong>' + totalMatched + '</strong> párosítás, <strong>' + elapsed + '</strong> mp (⌀' + speed + '/mp)';
+                // Status szöveg frissítése: befejeződött
+                var statusDiv = document.getElementById('autoMatchStatus');
+                if (statusDiv) statusDiv.innerHTML = '✅ Automatikus párosítás befejeződött';
+                // Add separator and summary after Szöveges pass
+                panel.innerHTML += '<hr class="my-2">';
+                panel.innerHTML += '<div class="small fw-bold mb-1">📊 Összesített státusz statisztika:</div>';
+                if (window._lastSummary) {
+                    var s = window._lastSummary;
+                    panel.innerHTML += '<div class="small d-flex gap-3 flex-wrap">' +
+                        '<span>📋 Összes tétel: <strong>' + Number(s.total).toLocaleString('hu-HU') + '</strong></span>' +
+                        '<span class="text-success">✅ OK: <strong>' + Number(s.ok_count).toLocaleString('hu-HU') + '</strong></span>' +
+                        '<span class="text-warning">⚠️ CSÚSZÁS: <strong>' + Number(s.csuszas_count).toLocaleString('hu-HU') + '</strong></span>' +
+                        '<span class="text-danger">❌ Párosítatlan: <strong>' + Number(s.unchecked_count).toLocaleString('hu-HU') + '</strong></span>' +
+                        '</div>';
+                }
                 panel.innerHTML += '<button class="btn btn-primary mt-2" onclick="document.getElementById(\'progressPanel\').style.display=\'none\'">Rendben</button>';
                 return;
             }
@@ -1015,6 +1303,11 @@ document.addEventListener('DOMContentLoaded', function() {
                         initialTotal = result.total_unchecked;
                     }
                     document.getElementById('passRow' + passIndex).innerHTML = '✅ ' + passNames[passIndex] + ': <strong>' + result.matched + '</strong> párosítás (' + result.time_sec + ' mp)';
+
+                    // Store summary if present (last pass)
+                    if (result.summary) {
+                        window._lastSummary = result.summary;
+                    }
 
                     // Update progress bar
                     var elapsed = (Date.now() - overallStart) / 1000;
@@ -1052,116 +1345,201 @@ document.addEventListener('DOMContentLoaded', function() {
 <div class="container">
     <div class="d-flex justify-content-between align-items-center mb-3 px-3 py-2 bg-white rounded border shadow-sm">
         <div class="d-flex align-items-center gap-2">
+            <a href="index.php" class="btn btn-outline-secondary btn-sm">🏠 Kezdőlap</a>
             <span class="fw-bold">🕵️ Revizor Asszisztens 1.0</span>
             <span class="text-muted mx-1">|</span>
             <span class="text-muted">Feltöltés</span>
         </div>
         <div class="d-flex align-items-center gap-1">
-            <a href="index.php" class="btn btn-outline-secondary btn-sm">🏠 Kezdőlap</a>
             <a href="help.php" class="btn btn-outline-primary btn-sm">❓ Súgó</a>
-            <a href="logout.php" class="btn btn-outline-danger btn-sm ms-1">Kilépés</a>
+            <?php render_dev_toggle(); ?>
+            <?php render_user_badge(); ?>
+            <a href="logout.php" class="btn btn-outline-danger btn-sm">Kilépés</a>
         </div>
     </div>
 
+    <?php
+    // Feltöltési előzmények lekérdezése
+    $ul_res = $conn->query("SELECT id, filename, file_size, row_count, matched_count, skipped_count, duplicate_count, church_name, uploaded_by, upload_type, warning, created_at FROM upload_log ORDER BY created_at DESC LIMIT 20");
+    $upload_logs = [];
+    if ($ul_res) { while ($ul = $ul_res->fetch_assoc()) { $upload_logs[] = $ul; } }
+    ?>
+
     <?php if ($is_admin): ?>
 
-    <div class="upload-card mb-4">
-        <h4 class="mb-3">📥 Egyedi Gyülekezet Feltöltése</h4>
-        <?php echo $message; ?>
-        <form action="upload.php" method="POST" enctype="multipart/form-data" class="mt-4" autocomplete="off">
-            <input type="hidden" name="single_upload" value="1">
-            <input type="hidden" name="csrf_token" value="<?php echo htmlspecialchars($_SESSION['csrf_token']); ?>">
-            <div class="mb-4">
-                <label class="form-label fw-bold">1. Gyülekezet (Gépelj a kereséshez):</label>
-                <input list="churches" name="church_search" id="church_search" class="form-control form-control-lg" placeholder="Kezdj el gépelni egy nevet vagy ID-t..." required>
-                <datalist id="churches">
-                    <?php foreach ($church_options as $church): ?>
-                        <option value="<?php echo htmlspecialchars($church['name']); ?> (ID: <?php echo $church['id']; ?>)">
+    <div class="accordion-wrapper">
+    <div class="accordion" id="uploadAccordion">
+
+      <div class="accordion-item">
+        <h2 class="accordion-header">
+          <button class="accordion-button" type="button" data-bs-toggle="collapse" data-bs-target="#collapseHistory" aria-expanded="false">
+            📋 Feltöltési előzmények (20 utolsó)
+          </button>
+        </h2>
+        <div id="collapseHistory" class="accordion-collapse collapse" data-bs-parent="#uploadAccordion">
+          <div class="accordion-body p-2">
+            <?php if (empty($upload_logs)): ?>
+              <p class="small text-muted mb-0">Még nincs feltöltési előzmény.</p>
+            <?php else: ?>
+              <div class="table-responsive">
+                <table class="table table-sm table-bordered small mb-0">
+                  <thead>
+                    <tr class="table-dark">
+                      <th>Dátum</th><th>Fájl</th><th>Típus</th><th>Gyülekezet</th><th>Sorok</th><th>Párosítva</th><th>Duplikált</th><th>Feltöltő</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    <?php foreach ($upload_logs as $ul): ?>
+                      <tr>
+                        <td class="text-nowrap"><?= htmlspecialchars($ul['created_at']) ?></td>
+                        <td title="<?= htmlspecialchars($ul['filename'] . ' (' . number_format($ul['file_size']) . ' bájt)') ?>"><?= htmlspecialchars(mb_substr($ul['filename'], 0, 40)) ?></td>
+                        <td><?= $ul['upload_type'] === 'multi' || $ul['upload_type'] === 'multi_ajax' ? 'Többes' : 'Egyedi' ?></td>
+                        <td><?= htmlspecialchars($ul['church_name'] ?: '-') ?></td>
+                        <td><?= number_format($ul['row_count']) ?></td>
+                        <td><?= number_format($ul['matched_count']) ?></td>
+                        <td><?= number_format($ul['duplicate_count']) ?></td>
+                        <td><?= htmlspecialchars($ul['uploaded_by'] ?: '-') ?></td>
+                      </tr>
                     <?php endforeach; ?>
-                </datalist>
-            </div>
-            <div class="mb-4">
-                <label class="form-label fw-bold">2. K&H CSV Fájl:</label>
-                <input class="form-control" type="file" name="bank_file" accept=".csv,.txt" required>
-            </div>
-            <button type="submit" class="btn btn-primary w-100">Feltöltés</button>
-        </form>
-    </div>
-
-    <div class="upload-card">
-        <h4 class="mb-3">📥 Automatikus (Több Gyülekezet) Feltöltés</h4>
-        <p class="small text-muted">A rendszer a számlaszámok alapján automatikusan azonosítja a gyülekezeteket az adatbázisban tárolt bankszámla-nyilvántartás segítségével.</p>
-        <form id="multiUploadForm" action="upload.php" method="POST" enctype="multipart/form-data" class="mt-4">
-            <input type="hidden" name="csrf_token" value="<?php echo htmlspecialchars($_SESSION['csrf_token']); ?>">
-            <div class="mb-4">
-                <label class="form-label fw-bold">K&H CSV Fájl:</label>
-                <input class="form-control" type="file" name="multi_bank_file" accept=".csv,.txt" required>
-            </div>
-            <button type="submit" class="btn btn-success w-100">Összesített Feltöltés</button>
-        </form>
-        <div id="multiProgress" class="mt-3" style="display:none;"></div>
-    </div>
-
-    <div class="upload-card mt-4">
-        <h4 class="mb-3">⚙️ Kihagyandó bankszámlák (import)</h4>
-        <p class="small text-muted mb-3">Jelöld be azokat a számlákat, amelyeket az automatikus tömeges import mindig figyelmen kívül hagyjon.</p>
-        <form action="upload.php" method="POST">
-            <input type="hidden" name="save_skip_config" value="1">
-            <input type="hidden" name="csrf_token" value="<?php echo htmlspecialchars($_SESSION['csrf_token']); ?>">
-            <div class="table-responsive" style="max-height:260px; overflow:auto; border:1px solid #e9ecef; border-radius:10px;">
-                <table class="table table-sm table-striped mb-0 align-middle">
-                    <thead class="table-light" style="position:sticky; top:0; z-index:1;">
-                        <tr>
-                            <th style="width:120px;">Kihagyás</th>
-                            <th style="width:120px;">Church ID</th>
-                            <th>Gyülekezet</th>
-                            <th style="width:220px;">Bankszámla</th>
-                        </tr>
-                    </thead>
-                    <tbody>
-                        <?php foreach ($account_config_rows as $acc_row): ?>
-                            <?php
-                                $cid = (int)$acc_row['church_id'];
-                                $church_label = $church_names[$cid] ?? ($cid === 0 ? 'TET / Intézményi' : 'Ismeretlen gyülekezet');
-                                $clean_acc = preg_replace('/[^0-9]/', '', $acc_row['bank_account_clean'] ?? '');
-                                $acc_mask = strlen($clean_acc) > 12
-                                    ? substr($clean_acc, 0, 8) . '...' . substr($clean_acc, -4)
-                                    : $clean_acc;
-                            ?>
-                            <tr>
-                                <td>
-                                    <div class="form-check form-switch mb-0">
-                                        <input class="form-check-input" type="checkbox" name="skip_import[]" value="<?php echo (int)$acc_row['id']; ?>" <?php echo !empty($acc_row['skip_import']) ? 'checked' : ''; ?>>
-                                    </div>
-                                </td>
-                                <td><?php echo $cid; ?></td>
-                                <td><?php echo htmlspecialchars($church_label); ?></td>
-                                <td><code><?php echo htmlspecialchars($acc_mask); ?></code></td>
-                            </tr>
-                        <?php endforeach; ?>
-                    </tbody>
+                  </tbody>
                 </table>
+              </div>
+            <?php endif; ?>
+          </div>
+        </div>
+      </div>
+
+      <div class="accordion-item">
+        <h2 class="accordion-header">
+          <button class="accordion-button" type="button" data-bs-toggle="collapse" data-bs-target="#collapseOne" aria-expanded="true">
+            📥 Egyedi Gyülekezet Feltöltése
+          </button>
+        </h2>
+        <div id="collapseOne" class="accordion-collapse collapse show" data-bs-parent="#uploadAccordion">
+          <div class="accordion-body">
+            <?php if ($message): ?>
+            <div style="position:relative;">
+              <?php echo $message; ?>
+              <a href="?clear_msg=1" class="btn btn-sm btn-outline-secondary" style="position:absolute;top:8px;right:8px;">✕</a>
             </div>
-            <div class="mt-3 d-flex justify-content-end">
-                <button type="submit" class="btn btn-outline-primary btn-sm">Mentés</button>
-            </div>
-        </form>
+            <?php endif; ?>
+            <form action="upload.php" method="POST" enctype="multipart/form-data" autocomplete="off">
+                <input type="hidden" name="single_upload" value="1">
+                <input type="hidden" name="csrf_token" value="<?php echo htmlspecialchars($_SESSION['csrf_token']); ?>">
+                <div class="mb-3">
+                    <label class="form-label fw-bold">1. Gyülekezet (Gépelj a kereséshez):</label>
+                    <input list="churches" name="church_search" id="church_search" class="form-control" placeholder="Kezdj el gépelni egy nevet vagy ID-t..." required>
+                    <datalist id="churches">
+                        <?php foreach ($church_options as $church): ?>
+                            <option value="<?php echo htmlspecialchars($church['name']); ?> (ID: <?php echo $church['id']; ?>)">
+                        <?php endforeach; ?>
+                    </datalist>
+                </div>
+                <div class="mb-3">
+                    <label class="form-label fw-bold">2. K&H CSV Fájl:</label>
+                    <input class="form-control" type="file" name="bank_file" accept=".csv,.txt" required>
+                </div>
+                <button type="submit" class="btn btn-primary w-100">Feltöltés</button>
+            </form>
+          </div>
+        </div>
+      </div>
+
+      <div class="accordion-item">
+        <h2 class="accordion-header">
+          <button class="accordion-button collapsed" type="button" data-bs-toggle="collapse" data-bs-target="#collapseTwo" aria-expanded="false">
+            📥 Automatikus (Több Gyülekezet) Feltöltés
+          </button>
+        </h2>
+        <div id="collapseTwo" class="accordion-collapse collapse" data-bs-parent="#uploadAccordion">
+          <div class="accordion-body">
+            <p class="small text-muted">A rendszer a számlaszámok alapján automatikusan azonosítja a gyülekezeteket az adatbázisban tárolt bankszámla-nyilvántartás segítségével.</p>
+            <form id="multiUploadForm" action="upload.php" method="POST" enctype="multipart/form-data">
+                <input type="hidden" name="csrf_token" value="<?php echo htmlspecialchars($_SESSION['csrf_token']); ?>">
+                <div class="mb-3">
+                    <label class="form-label fw-bold">K&H CSV Fájl:</label>
+                    <input class="form-control" type="file" name="multi_bank_file" accept=".csv,.txt" required>
+                </div>
+                <button type="submit" class="btn btn-success w-100">Összesített Feltöltés</button>
+            </form>
+            <div id="multiProgress" class="mt-3" style="display:none;"></div>
+          </div>
+        </div>
+      </div>
+
+      <div class="accordion-item">
+        <h2 class="accordion-header">
+          <button class="accordion-button collapsed" type="button" data-bs-toggle="collapse" data-bs-target="#collapseThree" aria-expanded="false">
+            ⚙️ Kihagyandó bankszámlák (import)
+          </button>
+        </h2>
+        <div id="collapseThree" class="accordion-collapse collapse" data-bs-parent="#uploadAccordion">
+          <div class="accordion-body">
+            <p class="small text-muted mb-3">Jelöld be azokat a számlákat, amelyeket az automatikus tömeges import mindig figyelmen kívül hagyjon.</p>
+            <form action="upload.php" method="POST">
+                <input type="hidden" name="save_skip_config" value="1">
+                <input type="hidden" name="csrf_token" value="<?php echo htmlspecialchars($_SESSION['csrf_token']); ?>">
+                <div class="table-responsive" style="max-height:260px; overflow:auto; border:1px solid #e9ecef; border-radius:10px;">
+                    <table class="table table-sm table-striped mb-0 align-middle">
+                        <thead class="table-light" style="position:sticky; top:0; z-index:1;">
+                            <tr>
+                                <th style="width:120px;">Kihagyás</th>
+                                <th style="width:120px;">Church ID</th>
+                                <th>Gyülekezet</th>
+                                <th style="width:220px;">Bankszámla</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <?php foreach ($account_config_rows as $acc_row): ?>
+                                <?php
+                                    $cid = (int)$acc_row['church_id'];
+                                    $church_label = $church_names[$cid] ?? ($cid === 0 ? 'TET / Intézményi' : 'Ismeretlen gyülekezet');
+                                    $clean_acc = preg_replace('/[^0-9]/', '', $acc_row['bank_account_clean'] ?? '');
+                                    $acc_mask = strlen($clean_acc) > 12
+                                        ? substr($clean_acc, 0, 8) . '...' . substr($clean_acc, -4)
+                                        : $clean_acc;
+                                ?>
+                                <tr>
+                                    <td>
+                                        <div class="form-check form-switch mb-0">
+                                            <input class="form-check-input" type="checkbox" name="skip_import[]" value="<?php echo (int)$acc_row['id']; ?>" <?php echo !empty($acc_row['skip_import']) ? 'checked' : ''; ?>>
+                                        </div>
+                                    </td>
+                                    <td><?php echo $cid; ?></td>
+                                    <td><?php echo htmlspecialchars($church_label); ?></td>
+                                    <td><code><?php echo htmlspecialchars($acc_mask); ?></code></td>
+                                </tr>
+                            <?php endforeach; ?>
+                        </tbody>
+                    </table>
+                </div>
+                <div class="mt-3 d-flex justify-content-end">
+                    <button type="submit" class="btn btn-outline-primary btn-sm">Mentés</button>
+                </div>
+            </form>
+          </div>
+        </div>
+      </div>
+
     </div>
 
-        <!-- Progress Panel -->
-        <div id="progressPanel" class="mt-3 border rounded p-3 bg-light" style="display:none;"></div>
+</div> <!-- accordion-wrapper -->
+
+    <!-- Progress Panel -->
+    <div id="progressPanel" class="mt-3 border rounded p-3 bg-light" style="display:none;"></div>
+
+    <div class="mt-3 small text-end">
+        <a href="#" onclick="if(confirm('Biztosan törlöd az összes banki rekordot?')){var f=document.createElement('form');f.method='POST';f.action='database/reset.php';var t1=document.createElement('input');t1.type='hidden';t1.name='csrf_token';t1.value='<?php echo htmlspecialchars($_SESSION['csrf_token']); ?>';f.appendChild(t1);var t2=document.createElement('input');t2.type='hidden';t2.name='confirm';t2.value='1';f.appendChild(t2);document.body.appendChild(f);f.submit();}return false;" class="text-decoration-none text-muted">🧹 Adatbázis reset</a>
     </div>
 
     <?php else: ?>
-
-    <div class="text-center py-5">
         <div class="display-1 text-danger mb-3">🚫</div>
         <h3 class="fw-bold mb-2">Ehhez nincs jogosultságod.</h3>
         <p class="text-muted lead mb-4">Ezt a funkciót csak az adminisztrátor használhatja.</p>
         <a href="index.php" class="btn btn-primary">← Vissza a kezdőlapra</a>
-    </div>
 
     <?php endif; ?>
+</div> <!-- container -->
 </div>
 
 <!-- Session warning modal -->
@@ -1237,7 +1615,21 @@ setInterval(() => {
         window.location.href = 'logout.php';
     }
 }, 1000);
+
+// Feltöltési űrlapok státuszjelzése
+document.querySelectorAll('form[action="upload.php"]').forEach(function(f) {
+    f.addEventListener('submit', function() {
+        var panel = document.getElementById('progressPanel');
+        if (!panel) return;
+        panel.style.display = 'block';
+        var msg = 'Bankszámlaszámok ellenőrzése...';
+        if (f.querySelector('[name="multi_upload"]')) msg = 'Fájl feldolgozása (több gyülekezet)...';
+        else if (f.querySelector('[name="single_upload"]')) msg = 'Fájl feldolgozása (egyedi gyülekezet)...';
+        panel.innerHTML = '<div class="py-3 text-center"><div class="spinner-border spinner-border-sm me-2"></div>' + msg + '</div>';
+    });
+});
 </script>
 
+<script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
 </body>
 </html>

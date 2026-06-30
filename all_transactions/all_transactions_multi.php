@@ -17,10 +17,20 @@
     exit;
   }
 
+  require_once __DIR__ . '/../lib/bootstrap.php';
+  require_once __DIR__ . '/../lib/auth.php';
   if (!isset($_SESSION[GN_CHURCH_ID]) || $_SESSION[GN_CHURCH_ID] <= 0)
   {
-    header("Location: ../login.php");
-    exit;
+    build_user_context_from_ots();
+    $acs = get_accessible_church_ids();
+    if ($acs === null) {
+      $_SESSION[GN_CHURCH_ID] = 1;
+    } elseif (is_array($acs) && count($acs) > 0) {
+      $_SESSION[GN_CHURCH_ID] = $acs[0];
+    } else {
+      header("Location: ../login.php");
+      exit;
+    }
   }
 
   // A Webix keretrendszer betöltése (abszolút /ots/ útvonalakkal, mert nincs virtuális host)
@@ -33,7 +43,7 @@
   echo '  <head>' . "\n";
   echo '  <meta name="robots" content="noindex" />' . "\n";
   echo '  <meta http-equiv="Content-Type" content="text/html; charset=utf-8" />' . "\n";
-  echo '  <title>Revizor Asszisztens 1.0 – OTS Tranzakciók</title>' . "\n";
+  echo '  <title>🕵️ Revizor Asszisztens 1.0 – OTS Tranzakciók</title>' . "\n";
   echo '  <script type="text/javascript">webix_skin = "' . $mc_skin . '";</script>' . "\n";
   echo '  <script src="' . $ots_root . '/ots_icons.js" type="text/javascript" charset="utf-8"></script>' . "\n";
   echo '  <link rel="stylesheet" href="' . $ots_root . '/3rdparty/webix/' . $skin_css . '.css">' . "\n";
@@ -47,19 +57,22 @@
   echo '  <link rel="stylesheet" href="' . $ots_root . '/css/ots.css">' . "\n";
   echo '  <link rel="stylesheet" href="' . $ots_root . '/css/ots_' . $mc_skin . '.css">' . "\n";
   echo '  <script src="' . $ots_root . '/penztar_utils.js" type="text/javascript" charset="utf-8"></script>' . "\n";
+  echo '  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">' . "\n";
   echo '</head>' . "\n";
   echo '<body>' . "\n";
 ?>
-<div style="display:flex;align-items:center;justify-content:space-between;padding:6px 12px;background:#fff;border-bottom:1px solid #dee2e6;font-family:sans-serif;font-size:14px;">
-    <div style="display:flex;align-items:center;gap:8px;">
-        <span style="font-weight:700;">🕵️ Revizor Asszisztens 1.0</span>
-        <span style="color:#6c757d;">|</span>
-        <span style="color:#6c757d;">OTS Tranzakciók</span>
+<div class="d-flex justify-content-between align-items-center mb-3 px-3 py-2 bg-white rounded border shadow-sm flex-wrap gap-2" style="font-family:sans-serif;">
+    <div class="d-flex align-items-center gap-2 flex-wrap">
+        <a href="../index.php" class="btn btn-outline-secondary btn-sm">🏠 Kezdőlap</a>
+        <span class="fw-bold">🕵️ Revizor Asszisztens 1.0</span>
+        <span class="text-muted mx-1">|</span>
+        <span class="text-muted">OTS Tranzakciók</span>
     </div>
-    <div style="display:flex;align-items:center;gap:4px;">
-        <a href="../index.php" style="text-decoration:none;padding:2px 8px;border:1px solid #6c757d;border-radius:4px;color:#6c757d;font-size:13px;">🏠 Kezdőlap</a>
-        <a href="../help.php" style="text-decoration:none;padding:2px 8px;border:1px solid #0d6efd;border-radius:4px;color:#0d6efd;font-size:13px;">❓ Súgó</a>
-        <a href="../logout.php" style="text-decoration:none;padding:2px 8px;border:1px solid #dc3545;border-radius:4px;color:#dc3545;font-size:13px;margin-left:4px;">Kilépés</a>
+    <div class="d-flex align-items-center gap-1">
+        <a href="../help.php" class="btn btn-outline-primary btn-sm">❓ Súgó</a>
+        <?php render_dev_toggle(); ?>
+        <?php render_user_badge(); ?>
+        <a href="../logout.php" class="btn btn-outline-danger btn-sm">Kilépés</a>
     </div>
 </div>
 <style>
@@ -266,7 +279,7 @@ webix.ui.datafilter.lastBalance = {
   }
 };
 
-// Több kulcsszavas OR szűrő a Partner / Megjegyzés oszlophoz.
+// Több kulcsszavas AND szűrő a Partner / Megjegyzés oszlophoz.
 function splitMultiFilterTokens(value) {
   return String(value || "")
     .toLowerCase()
@@ -283,9 +296,9 @@ function multiTextFilterCompare(value, filter, item) {
 
   var hay = (value == null ? "" : String(value)).toLowerCase();
   for (var i = 0; i < tokens.length; i++) {
-    if (hay.indexOf(tokens[i]) !== -1) return true;
+    if (hay.indexOf(tokens[i]) === -1) return false;
   }
-  return false;
+  return true;
 }
 
 webix.ui.datafilter.multiTextFilter = webix.extend({
@@ -299,9 +312,9 @@ webix.ui.datafilter.multiTextFilter = webix.extend({
 
     var hay = (value == null ? "" : String(value)).toLowerCase();
     for (var i = 0; i < tokens.length; i++) {
-      if (hay.indexOf(tokens[i]) !== -1) return true;
+      if (hay.indexOf(tokens[i]) === -1) return false;
     }
-    return false;
+    return true;
   }
 }, webix.ui.datafilter.textFilter);
 
@@ -336,7 +349,7 @@ webix.ready(function(){
             cols: [
               { view: "datepicker", label: "Kezdő dátum:", name: "start_date", format: "%Y.%m.%d", stringResult: true, value: savedStartDate(), labelWidth: 105, width: 220 },
               { view: "datepicker", label: "Befejező dátum:", name: "end_date", format: "%Y.%m.%d", stringResult: true, value: new Date(), labelWidth: 115, width: 230 },
-              { view: "combo", label: "Gyülekezet:", name: "church_id", options: "/ots/church_for_combo.php?userole=1", value: savedChurchId(<?php echo intval($_SESSION[GN_CHURCH_ID]); ?>), labelWidth: 90, width: 270 },
+              { view: "combo", label: "Gyülekezet:", name: "church_id", options: "/ots/church_for_combo.php?userole=1", value: savedChurchId(<?php echo intval(!is_admin() && !empty($_SESSION['revizor_selected_church']) ? $_SESSION['revizor_selected_church'] : (isset($_SESSION[GN_CHURCH_ID]) ? $_SESSION[GN_CHURCH_ID] : 0)); ?>), labelWidth: 90, width: 270<?= !is_admin() ? ', readonly:true' : '' ?> },
               { view: "segmented", label: "Forgalom:", name: "flow", value: savedFlow(), options: [
                   { id: "bank", value: "<span class='webix_icon fas fa-university' title='Bank'></span>" },
                   { id: "cash", value: "<span class='webix_icon fas fa-money-bill-wave' title='Készpénz'></span>" },
@@ -475,12 +488,15 @@ webix.ready(function(){
 
   // record_id URL param kezelése — OTS-ből ugrás
   var urlRecordId = (new URLSearchParams(window.location.search)).get('record_id');
+  var urlChurchId = (new URLSearchParams(window.location.search)).get('church_id');
   if (urlRecordId) {
     var now = new Date();
     var start = new Date(now.getFullYear(), 0, 1);
     var form = $$("export_form");
     if (form) {
-      form.setValues({ start_date: start, end_date: now });
+      var vals = { start_date: start, end_date: now };
+      if (urlChurchId) vals.church_id = urlChurchId;
+      form.setValues(vals);
       webix.delay(function() {
         var btn = form.queryView({ view: "button", value: "Lekérdezés" });
         if (btn) btn.callEvent("onItemClick", []);
@@ -504,10 +520,6 @@ webix.ready(function(){
   }
 });
 </script>
-<div style="position:fixed; top:10px; left:10px; z-index:9999;">
-  <a href="../index.php" class="btn btn-outline-secondary btn-sm">🏠 Kezdőlap</a>
-  <a href="../logout.php" class="btn btn-outline-danger btn-sm ms-1">Kilépés</a>
-</div>
 
 <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
 

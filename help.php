@@ -2,7 +2,7 @@
 <html lang="hu">
 <head>
     <meta charset="UTF-8">
-    <title>Revizor Asszisztens 1.0 – Súgó</title>
+    <title>🕵️ Revizor Asszisztens 1.0 – Súgó</title>
     <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
     <style>
         body { background-color: #f8f9fa; padding: 40px; }
@@ -19,18 +19,18 @@
 
     <div class="d-flex justify-content-between align-items-center mb-3 px-3 py-2 bg-white rounded border shadow-sm">
         <div class="d-flex align-items-center gap-2">
+            <a href="index.php" class="btn btn-outline-secondary btn-sm">🏠 Kezdőlap</a>
             <span class="fw-bold">🕵️ Revizor Asszisztens 1.0</span>
             <span class="text-muted mx-1">|</span>
             <span class="text-muted">Súgó</span>
         </div>
         <div class="d-flex align-items-center gap-1">
-            <a href="index.php" class="btn btn-outline-secondary btn-sm">🏠 Kezdőlap</a>
-            <a href="logout.php" class="btn btn-outline-danger btn-sm ms-1">Kilépés</a>
+            <a href="logout.php" class="btn btn-outline-danger btn-sm">Kilépés</a>
         </div>
     </div>
 
     <div class="help-card">
-        <h2>📖 Revizor Asszisztens 1.0 - Használati Útmutató</h2>
+        <h2>📖 🕵️ Revizor Asszisztens 1.0 - Használati Útmutató</h2>
         <p class="lead">Ez a bankegyeztető rendszer kezdetben a banki kivonatok és az OTS könyvelési adatok gyors, precíz összevetésére készült, később kiegészült egyéb funkciókkal is: automatikus progresszív párosítás (7 lépésben), tranzakció kereső (bank/OTS/ mindkettő), OTS tranzakciók lekérdezése és exportálása, egyházterületi (TET) számlák kezelése, több tételes párosítás, szöveges aggregációs keresés, valamint automatikus session hosszabbítás.</p>
 
         <div class="mb-4 p-3 bg-light rounded border">
@@ -83,7 +83,7 @@
         </div>
 
         <div class="mt-5 text-center">
-            <a href="index.php" class="btn btn-primary px-5">🏠 Vissza a Revizor Asszisztenshez</a>
+            <a href="index.php" class="btn btn-primary px-5">🏠 Vissza a főoldalra</a>
             <a href="logout.php" class="btn btn-outline-danger px-4 ms-2">Kilépés</a>
         </div>
     </div>

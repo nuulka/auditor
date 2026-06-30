@@ -4,6 +4,7 @@
 return [
     'demo_mode' => false,
     'demo_reviewer_church_id' => 43,
+    'superadmin_user_id' => null,
     'db' => [
         'revizor' => [
             'host' => getenv('REVIZOR_DB_HOST') ?: 'localhost',

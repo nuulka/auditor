@@ -11,6 +11,21 @@ if (PHP_SAPI !== 'cli' && !headers_sent()) {
     ]);
 }
 
+// Debug session endpoint — shows raw session state (remove after diagnosis)
+if (isset($_GET['debug_session'])) {
+    header('Content-Type: application/json');
+    if (session_status() != PHP_SESSION_ACTIVE) { session_start(); }
+    require_once __DIR__ . '/../ots/session_handler.php';
+    echo json_encode([
+        'session_id' => session_id(),
+        'has_gc_login_cookie' => isset($_SESSION[GC_LOGIN_COOKIE]),
+        'has_revizor_app_role' => isset($_SESSION['revizor_app_role']),
+        'session_keys' => array_keys($_SESSION),
+        'gc_login_cookie_value' => isset($_SESSION[GC_LOGIN_COOKIE]) ? $_SESSION[GC_LOGIN_COOKIE] : null,
+    ]);
+    exit;
+}
+
 // AJAX session check endpoint — must run before session_destroy
 if (isset($_GET['check'])) {
     header('Content-Type: application/json');
@@ -42,6 +57,24 @@ if ($just_logged_in) {
         $acs = get_accessible_church_ids();
         if (is_array($acs) && count($acs) === 1) {
             $_SESSION['revizor_selected_church'] = $acs[0];
+            // also save the name
+            try {
+                $ots = get_ots_conn();
+                $sn = $ots->prepare("SELECT name FROM ots.churches WHERE id = ?");
+                if ($sn) {
+                    $sn->bind_param('i', $acs[0]);
+                    $sn->execute();
+                    $snr = $sn->get_result();
+                    if ($snr && ($snr = $snr->fetch_assoc())) {
+                        $_SESSION['revizor_selected_church_name'] = $snr['name'];
+                    }
+                }
+            } catch (Throwable $e) {}
+        } elseif (is_array($acs) && count($acs) > 1) {
+            // multiple churches — redirect to selection page
+            session_regenerate_id(true);
+            header('Location: select-church.php?redirect=index.php');
+            exit;
         }
         session_regenerate_id(true);
     } catch (Throwable $e) {
@@ -50,12 +83,13 @@ if ($just_logged_in) {
     header('Location: index.php');
     exit;
 }
+$session_expired = isset($_SESSION[GC_LOGIN_COOKIE]) || isset($_SESSION['revizor_app_role']);
 session_destroy();
 ?><!DOCTYPE html>
 <html lang="hu">
 <head>
     <meta charset="UTF-8">
-    <title>Revizor Asszisztens 1.0 - Bejelentkezés</title>
+    <title>🕵️ Revizor Asszisztens 1.0 - Bejelentkezés</title>
     <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
     <style>
         body { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); min-height: 100vh; display: flex; align-items: center; justify-content: center; }
@@ -65,11 +99,11 @@ session_destroy();
 </head>
 <body>
     <div class="login-card">
-        <div class="logo">🕵️</div>
-        <h4 class="mb-1">Revizor Asszisztens 1.0</h4>
-        <p class="text-muted small mb-4">Bankegyeztető rendszer</p>
+        <div class="logo">🏦</div>
+        <h4 class="mb-1">🕵️ Revizor Asszisztens 1.0</h4>
+        <p class="text-muted small mb-4">Bankegyeztető és bizonylat ellenőrző rendszer</p>
         <hr>
-        <p class="mb-3">A munkameneted lejárt. Jelentkezz be az OTS rendszerbe!</p>
+        <p class="mb-3">Jelentkezz be az OTS rendszerbe!<?php if ($session_expired): ?> A munkameneted lejárt.<?php endif; ?></p>
         <ol class="text-start small text-muted mb-4">
             <li>Kattints a <strong>Belépés az OTS-be</strong> gombra</li>
             <li>Jelentkezz be az OTS felületén (felugró ablakban nyílik meg)</li>
@@ -103,7 +137,7 @@ session_destroy();
             if (result.logged_in) {
                 document.getElementById('loginStatus').innerHTML = '✅ Sikeres belépés! Átirányítás...';
                 if (otsPopup && !otsPopup.closed) { try { otsPopup.close(); } catch(e) {} }
-                window.location.href = 'index.php';
+                window.location.href = 'login.php?ots_ready=1';
             } else {
                 setTimeout(pollSession, 1500);
             }

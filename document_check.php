@@ -16,7 +16,13 @@ $accessible_church_ids = get_accessible_church_ids();
 $session_remaining = ensure_revizor_session_timeout();
 ensure_revizor_csrf_token();
 
-$church_id = isset($_GET['church_id']) ? intval($_GET['church_id']) : 0;
+if (isset($_GET['church_id'])) {
+    $church_id = intval($_GET['church_id']);
+} elseif (!is_admin() && isset($_SESSION['revizor_selected_church']) && $_SESSION['revizor_selected_church'] > 0) {
+    $church_id = intval($_SESSION['revizor_selected_church']);
+} else {
+    $church_id = 0;
+}
 function normalize_doccheck_date($value) {
     $value = trim((string)$value);
     if ($value === '') {
@@ -31,6 +37,8 @@ function normalize_doccheck_date($value) {
 
 $date_from = normalize_doccheck_date($_GET['date_from'] ?? '');
 $date_to = normalize_doccheck_date($_GET['date_to'] ?? '');
+$amount_min = isset($_GET['amount_min']) && $_GET['amount_min'] !== '' ? floatval($_GET['amount_min']) : null;
+$amount_max = isset($_GET['amount_max']) && $_GET['amount_max'] !== '' ? floatval($_GET['amount_max']) : null;
 
 // AJAX: audit checklist mentése
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['action'] === 'save_audit') {
@@ -75,7 +83,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['
     exit;
 }
 
-// Gyülekezet lista
+// Gyülekezet lista (csak adminoknak a dropdown-hoz)
 $churches = [];
 if (is_admin()) {
     $c_res = $conn->prepare("SELECT DISTINCT br.church_id, c.name FROM bank_reconciliation br LEFT JOIN ots.churches c ON br.church_id = c.id WHERE br.church_id > 0 ORDER BY c.name");
@@ -83,27 +91,17 @@ if (is_admin()) {
         $c_res->execute();
         $c_res = $c_res->get_result();
     }
-} elseif (empty($accessible_church_ids)) {
-    $c_res = false;
-} else {
-    $allowed_ids = array_values(array_filter(array_map('intval', $accessible_church_ids), function ($v) { return $v > 0; }));
-    if (empty($allowed_ids)) {
-        $c_res = false;
-    } else {
-        $placeholders = implode(',', array_fill(0, count($allowed_ids), '?'));
-        $c_sql = "SELECT DISTINCT br.church_id, c.name FROM bank_reconciliation br LEFT JOIN ots.churches c ON br.church_id = c.id WHERE br.church_id IN ($placeholders) ORDER BY c.name";
-        $c_stmt = $conn->prepare($c_sql);
-        if ($c_stmt) {
-            $types = str_repeat('i', count($allowed_ids));
-            $c_stmt->bind_param($types, ...$allowed_ids);
-            $c_stmt->execute();
-            $c_res = $c_stmt->get_result();
-        } else {
-            $c_res = false;
-        }
+    if ($c_res) { while ($c = $c_res->fetch_assoc()) { $churches[] = $c; } }
+} elseif ($church_id > 0) {
+    // Nem admin: az aktuális gyülekezet nevét betöltjük a megjelenítéshez
+    $c_res = $conn->prepare("SELECT DISTINCT br.church_id, c.name FROM bank_reconciliation br LEFT JOIN ots.churches c ON br.church_id = c.id WHERE br.church_id = ?");
+    if ($c_res) {
+        $c_res->bind_param('i', $church_id);
+        $c_res->execute();
+        $c_res = $c_res->get_result();
+        if ($c_res) { while ($c = $c_res->fetch_assoc()) { $churches[] = $c; } }
     }
 }
-if ($c_res) { while ($c = $c_res->fetch_assoc()) { $churches[] = $c; } }
 
 // Lekérdezés
 $clauses = ['br.church_id > 0'];
@@ -122,6 +120,8 @@ if ($church_id > 0) {
 }
 if ($date_from) { $clauses[] = 'br.bank_date >= ?'; $params[] = $date_from; $types .= 's'; }
 if ($date_to) { $clauses[] = 'br.bank_date <= ?'; $params[] = $date_to; $types .= 's'; }
+if ($amount_min !== null) { $clauses[] = 'ABS(br.bank_amount) >= ?'; $params[] = $amount_min; $types .= 'd'; }
+if ($amount_max !== null) { $clauses[] = 'ABS(br.bank_amount) <= ?'; $params[] = $amount_max; $types .= 'd'; }
 $where_sql = implode(' AND ', $clauses);
 
 $sql = "SELECT br.*, c.name AS church_name,
@@ -135,7 +135,7 @@ $sql = "SELECT br.*, c.name AS church_name,
         LEFT JOIN audit_checklist ac ON br.id = ac.bank_reconciliation_id
         WHERE $where_sql
         ORDER BY br.bank_date DESC
-        LIMIT 500";
+        LIMIT 2000";
 $result = null;
 if (!empty($params)) {
     $stmt = $conn->prepare($sql);
@@ -159,7 +159,7 @@ if ($result) {
 <html lang="hu">
 <head>
     <meta charset="UTF-8">
-    <title>Revizor Asszisztens 1.0 – Bizonylat Ellenőrzés</title>
+    <title>🕵️ Revizor Asszisztens 1.0 – Bizonylat Ellenőrzés</title>
     <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
     <style>
         body { background: #f8f9fa; padding: 15px; font-size: 14px; }
@@ -167,6 +167,15 @@ if ($result) {
         .stat-card { text-align: center; padding: 15px; border-radius: 8px; }
         .stat-card h3 { margin: 0; font-size: 28px; font-weight: 700; }
         .stat-card small { color: #6c757d; }
+        .amount-clickable { cursor: pointer; }
+        .amount-clickable:hover { background: #e2e6ea !important; }
+        #docDetailModal .modal-body { max-height: 75vh; overflow-y: auto; }
+        #docDetailModal .detail-col { padding: 15px; }
+        #docDetailModal .detail-col h6 { border-bottom: 1px solid #dee2e6; padding-bottom: 6px; }
+        #docDetailModal .detail-table th { width: 35%; white-space: nowrap; }
+        #docDetailModal .detail-table td { word-break: break-word; }
+        .dd-accordion-body { padding: 0 !important; }
+        .dd-accordion-body table { margin: 0; }
         .checklist-item { padding: 6px 0; border-bottom: 1px solid #eee; }
         .checklist-item:last-child { border-bottom: none; }
         .progress-thin { height: 6px; margin-top: 4px; }
@@ -185,14 +194,14 @@ if ($result) {
     <!-- Fejléc -->
     <div class="d-flex justify-content-between align-items-center mb-3 px-3 py-2 bg-white rounded border shadow-sm">
         <div class="d-flex align-items-center gap-2">
+            <a href="index.php" class="btn btn-outline-secondary btn-sm">🏠 Kezdőlap</a>
             <span class="fw-bold">🕵️ Revizor Asszisztens 1.0</span>
             <span class="text-muted mx-1">|</span>
             <span class="text-muted">Bizonylat Ellenőrzés</span>
         </div>
         <div class="d-flex align-items-center gap-1">
-            <a href="index.php" class="btn btn-outline-secondary btn-sm">🏠 Kezdőlap</a>
             <a href="help.php" class="btn btn-outline-primary btn-sm">❓ Súgó</a>
-            <a href="logout.php" class="btn btn-outline-danger btn-sm ms-1">Kilépés</a>
+            <a href="logout.php" class="btn btn-outline-danger btn-sm">Kilépés</a>
         </div>
     </div>
 
@@ -233,12 +242,19 @@ if ($result) {
             <form method="GET" class="row g-2 align-items-end">
                 <div class="col-auto">
                     <label class="small mb-0">Gyülekezet</label>
+                    <?php if (is_admin()): ?>
                     <select name="church_id" class="form-select form-select-sm" style="width:200px;">
                         <option value="0">Összes</option>
                         <?php foreach ($churches as $c): ?>
                         <option value="<?= $c['church_id'] ?>" <?= $church_id === (int)$c['church_id'] ? 'selected' : '' ?>><?= htmlspecialchars($c['name'] ?? '#' . $c['church_id']) ?></option>
                         <?php endforeach; ?>
                     </select>
+                    <?php else: ?>
+                    <input type="hidden" name="church_id" value="<?= $church_id ?>">
+                    <span class="form-control form-control-sm bg-light" style="width:200px;display:inline-block;border:1px solid #dee2e6;padding:4px 8px;border-radius:4px;">
+                        🏛 <?= htmlspecialchars($churches[0]['name'] ?? '#' . $church_id) ?>
+                    </span>
+                    <?php endif; ?>
                 </div>
                 <div class="col-auto">
                     <label class="small mb-0">Dátum tól</label>
@@ -249,11 +265,24 @@ if ($result) {
                     <input type="date" name="date_to" class="form-control form-control-sm" value="<?= $date_to ?>" style="width:150px;">
                 </div>
                 <div class="col-auto">
+                    <label class="small mb-0">Összeg min (Ft)</label>
+                    <input type="number" name="amount_min" class="form-control form-control-sm" value="<?= $amount_min !== null ? $amount_min : '' ?>" style="width:130px;" step="1">
+                </div>
+                <div class="col-auto">
+                    <label class="small mb-0">Összeg max (Ft)</label>
+                    <input type="number" name="amount_max" class="form-control form-control-sm" value="<?= $amount_max !== null ? $amount_max : '' ?>" style="width:130px;" step="1">
+                </div>
+                <div class="col-auto">
                     <button type="submit" class="btn btn-primary btn-sm">🔎 Szűrés</button>
                     <a href="document_check.php" class="btn btn-outline-secondary btn-sm">✕</a>
                 </div>
             </form>
         </div>
+    </div>
+
+    <div class="d-flex justify-content-between align-items-center mb-2">
+        <small class="text-muted"><?= $total_count ?> találat (max. 2000 — szűkítsd a szűrőket ha többet keresel)</small>
+        <div></div>
     </div>
 
     <!-- Táblázat -->
@@ -288,7 +317,7 @@ if ($result) {
                             <td><?= $idx++ ?></td>
                             <td><?= htmlspecialchars($r['church_name'] ?? '-') ?></td>
                             <td><?= $r['bank_date'] ?></td>
-                            <td style="text-align:right;" class="<?= (float)$r['bank_amount'] < 0 ? 'text-danger' : 'text-success' ?> fw-bold"><?= number_format((float)$r['bank_amount'], 0, ',', ' ') ?> Ft</td>
+                            <td style="text-align:right;" class="amount-clickable <?= (float)$r['bank_amount'] < 0 ? 'text-danger' : 'text-success' ?> fw-bold" onclick="showDocDetail(<?= $r['id'] ?>)"><?= number_format((float)$r['bank_amount'], 0, ',', ' ') ?> Ft</td>
                             <td><?= htmlspecialchars(mb_substr($r['bank_desc'] ?? '-', 0, 60)) ?></td>
                             <td><span class="badge bg-<?= $r['status'] === 'OK' ? 'success' : ($r['status'] === 'UNCHECKED' ? 'secondary' : 'warning') ?>"><?= $r['status'] ?? 'UNCHECKED' ?></span></td>
                             <td><?= htmlspecialchars($r['inspector_name'] ?? '-') ?></td>
@@ -312,6 +341,40 @@ if ($result) {
             </div>
         </div>
     </div>
+</div>
+
+<!-- Részletes információ modal -->
+<div class="modal fade" id="docDetailModal" tabindex="-1" aria-hidden="true">
+  <div class="modal-dialog modal-xl">
+    <div class="modal-content">
+      <div class="modal-header bg-dark text-white">
+        <h5 class="modal-title" id="ddTitle">📄 Részletes információk</h5>
+        <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
+      </div>
+      <div class="modal-body p-0">
+        <div id="ddDoublePanel" class="row g-0" style="display:none;">
+          <div class="col-md-6 detail-col border-end">
+            <h6 class="text-primary"><strong>🏦 Banki adatok</strong></h6>
+            <div id="ddBankContent"></div>
+          </div>
+          <div class="col-md-6 detail-col bg-light">
+            <h6 class="text-secondary"><strong>🧾 OTS könyvelési adatok</strong></h6>
+            <div id="ddOtsContent"></div>
+          </div>
+        </div>
+        <div id="ddSinglePanel" class="row g-0" style="display:none;">
+          <div class="col-12 detail-col bg-light">
+            <h6 class="text-secondary"><strong>🧾 OTS könyvelési adatok</strong></h6>
+            <div id="ddOtsSingleContent"></div>
+          </div>
+        </div>
+        <div id="ddLoading" class="text-center py-5">
+          <span class="spinner-border spinner-border-sm me-2"></span>Adatok betöltése...
+        </div>
+        <div id="ddError" class="alert alert-danger text-center m-3" style="display:none;"></div>
+      </div>
+    </div>
+  </div>
 </div>
 
 <!-- Audit modal -->
@@ -426,6 +489,157 @@ function openAudit(bankRecId) {
     });
 }
 
+var docDetailModal = null;
+document.addEventListener("DOMContentLoaded", function() {
+    docDetailModal = new bootstrap.Modal(document.getElementById('docDetailModal'));
+});
+
+function showDocDetail(bankRecId) {
+    document.getElementById('ddLoading').style.display = 'block';
+    document.getElementById('ddDoublePanel').style.display = 'none';
+    document.getElementById('ddSinglePanel').style.display = 'none';
+    document.getElementById('ddError').style.display = 'none';
+
+    fetch('document_check_get.php?bank_reconciliation_id=' + bankRecId + '&detail=1')
+    .then(function(r) { return r.json(); })
+    .then(function(data) {
+        document.getElementById('ddLoading').style.display = 'none';
+        if (data.error) {
+            document.getElementById('ddError').textContent = data.error;
+            document.getElementById('ddError').style.display = 'block';
+            return;
+        }
+        document.getElementById('ddTitle').textContent = '📄 ' + (data.church_name || '') + ' — ' + (data.bank_date || '') + ' — ' + Number(data.bank_amount).toLocaleString('hu-HU') + ' Ft';
+
+        if (data.ots_data && data.ots_data.length > 0) {
+            var otsHtml = renderOtsDetailTable(data.ots_data);
+            if (data.is_bank) {
+                // Dupla panel
+                document.getElementById('ddBankContent').innerHTML = renderBankDetailTable(data);
+                document.getElementById('ddOtsContent').innerHTML = otsHtml;
+                document.getElementById('ddDoublePanel').style.display = 'flex';
+            } else {
+                // Csak OTS
+                document.getElementById('ddOtsSingleContent').innerHTML = otsHtml;
+                document.getElementById('ddSinglePanel').style.display = 'block';
+            }
+        } else {
+            // Nincs OTS kapcsolat — mutassuk csak a bank adatokat egy panelben
+            document.getElementById('ddBankContent').innerHTML = renderBankDetailTable(data);
+            document.getElementById('ddDoublePanel').style.display = 'flex';
+            // Az OTS oldal üresen marad — rejtsük el
+            document.getElementById('ddOtsContent').innerHTML = '<div class="alert alert-secondary m-2">Nincs hozzárendelt OTS könyvelési tétel.</div>';
+        }
+        docDetailModal.show();
+    })
+    .catch(function() {
+        document.getElementById('ddLoading').style.display = 'none';
+        document.getElementById('ddError').textContent = 'Hiba az adatok betöltésekor.';
+        document.getElementById('ddError').style.display = 'block';
+    });
+}
+
+function renderBankDetailTable(data) {
+    var amt = Number(data.bank_amount || 0);
+    var amtClass = amt < 0 ? 'text-danger' : 'text-success';
+    var desc = (data.bank_desc || '-');
+    var initName = data.bank_ext_name || '-';
+    var initAcc = data.bank_ext_acc || '-';
+    var benName = data.bank_ben_name || data.bank_ext_name || '-';
+    var benAcc = data.bank_ben_acc || '-';
+    var extRef = data.bank_ext_ref || '-';
+    var txCode = data.bank_tx_code || '-';
+    var stmtDate = data.bank_stmt_date || '-';
+
+    var html = '<table class="table table-sm table-striped table-bordered detail-table">';
+    html += '<tr><th>Gyülekezet:</th><td>' + (data.church_name || '-') + '</td></tr>';
+    html += '<tr><th>Dátum:</th><td>' + (data.bank_date || '-') + '</td></tr>';
+    html += '<tr><th>Összeg:</th><td class="fw-bold ' + amtClass + '">' + amt.toLocaleString('hu-HU') + ' Ft</td></tr>';
+    html += '<tr><th>Közlemény:</th><td>' + htmlspecialchars(desc) + '</td></tr>';
+    html += '<tr class="table-info"><th>Kezdeményező neve:</th><td>' + htmlspecialchars(initName) + '</td></tr>';
+    html += '<tr class="table-info"><th>Kezdeményező számla:</th><td>' + htmlspecialchars(initAcc) + '</td></tr>';
+    html += '<tr class="table-light"><th>Kedvezményezett neve:</th><td>' + htmlspecialchars(benName) + '</td></tr>';
+    html += '<tr class="table-light"><th>Kedvezményezett számla:</th><td>' + htmlspecialchars(benAcc) + '</td></tr>';
+    html += '<tr><th>Tranzakció azonosító:</th><td>' + htmlspecialchars(extRef) + '</td></tr>';
+    html += '<tr><th>Tranzakció kód:</th><td>' + htmlspecialchars(txCode) + '</td></tr>';
+    html += '<tr><th>Banki kivonat dátuma:</th><td>' + htmlspecialchars(stmtDate) + '</td></tr>';
+    html += '<tr><th>Állapot:</th><td><span class="badge bg-' + (data.status === 'OK' ? 'success' : (data.status === 'UNCHECKED' ? 'secondary' : 'warning')) + '">' + (data.status || 'UNCHECKED') + '</span></td></tr>';
+    if (data.updated_by) {
+        html += '<tr><th>Ellenőrizte / elfogadta:</th><td>' + htmlspecialchars(data.updated_by) + '</td></tr>';
+    }
+    html += '</table>';
+    return html;
+}
+
+function renderOtsDetailTable(otsData) {
+    if (!otsData || otsData.length === 0) return '<div class="alert alert-warning m-2">Nincs OTS könyvelési adat.</div>';
+    var html = '<div class="accordion" id="ddOtsAccordion">';
+    otsData.forEach(function(tx, idx) {
+        var txId = 'dd-tx-' + idx;
+        var otsDate = tx.DATETIME ? tx.DATETIME.substring(0, 10) : '-';
+        var adjAmount = Number(tx.adjusted_amount || tx.AMOUNT || 0);
+        var otsAmount = adjAmount.toLocaleString('hu-HU') + ' Ft';
+        var otsDesc = tx.ots_desc_full || '-';
+        var collapsed = idx > 0;
+
+        html += '<div class="accordion-item">' +
+            '<h2 class="accordion-header">' +
+                '<button class="accordion-button ' + (collapsed ? 'collapsed' : '') + '" type="button" data-bs-toggle="collapse" data-bs-target="#' + txId + '">' +
+                '<span class="fw-bold me-2">#' + (idx + 1) + '</span>' +
+                '<span class="badge bg-secondary me-2">' + otsDate + '</span>' +
+                '<span class="' + (adjAmount < 0 ? 'text-danger' : 'text-success') + ' fw-bold me-2">' + otsAmount + '</span>' +
+                '<small class="text-muted text-truncate" style="max-width:200px;">' + otsDesc + '</small>' +
+            '</button></h2>' +
+            '<div id="' + txId + '" class="accordion-collapse collapse ' + (collapsed ? '' : 'show') + '" data-bs-parent="#ddOtsAccordion">' +
+                '<div class="accordion-body p-0 dd-accordion-body">' +
+                    '<table class="table table-sm table-striped table-bordered detail-table">';
+
+        var keys = ['DATETIME', 'adjusted_amount', 'ots_desc_full', 'CASH_DOCUMENT_NUMBER', 'DECISION_NUMBER', 'ots_type_name', 'VIA_BANK', 'MODIFIED'];
+        var labels = {'DATETIME': 'Dátum', 'adjusted_amount': 'Összeg', 'ots_desc_full': 'Partner / Megjegyzés', 'CASH_DOCUMENT_NUMBER': 'Bizonylatszám', 'DECISION_NUMBER': 'Határozati szám', 'ots_type_name': 'Típus', 'VIA_BANK': 'Banki tranzakció', 'MODIFIED': 'Módosítás ideje'};
+
+        keys.forEach(function(k) {
+            if (k in tx && tx[k] !== null && tx[k] !== undefined) {
+                var val = tx[k];
+                var displayVal = val;
+                var style = '';
+                if (k === 'adjusted_amount') {
+                    displayVal = Number(val).toLocaleString('hu-HU') + ' Ft';
+                    style = val < 0 ? 'class="fw-bold text-danger"' : 'class="fw-bold text-success"';
+                } else if (k === 'VIA_BANK') {
+                    displayVal = val == 1 ? '✅ Igen' : '❌ Nem (készpénz)';
+                } else if (k === 'DATETIME' || k === 'MODIFIED') {
+                    displayVal = val.length >= 16 ? val.substring(0, 16) : val;
+                }
+                html += '<tr><th>' + (labels[k] || k) + ':</th><td ' + style + '>' + displayVal + '</td></tr>';
+            }
+        });
+
+        if (tx.ots_editor_name || tx.EDITED_BY) {
+            html += '<tr><th>Rögzítette:</th><td>' + (tx.ots_editor_name || '-') + (tx.EDITED_BY ? ' <span class="text-muted small">(' + tx.EDITED_BY + ')</span>' : '') + '</td></tr>';
+        }
+        if (tx.fund_name || tx.FUND_ID) {
+            html += '<tr><th>Alap:</th><td>' + (tx.fund_name || tx.FUND_ID) + '</td></tr>';
+        }
+
+        html += '</table></div></div></div>';
+    });
+    html += '</div>';
+
+    // Összegzés ha több tétel
+    if (otsData.length > 1) {
+        var sum = 0;
+        otsData.forEach(function(tx) { sum += Number(tx.adjusted_amount || tx.AMOUNT || 0); });
+        html += '<div class="text-center fw-bold py-1 border-top bg-light">Összesen: <span class="' + (sum < 0 ? 'text-danger' : 'text-success') + '">' + sum.toLocaleString('hu-HU') + ' Ft</span></div>';
+    }
+
+    return html;
+}
+
+function htmlspecialchars(str) {
+    if (!str) return '';
+    return String(str).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+
 function saveAudit() {
     var form = document.getElementById('auditForm');
     var data = new FormData(form);
@@ -503,6 +717,8 @@ function sortAuditTable(th) {
                     if (f.church_id) form.church_id.value = f.church_id;
                     if (f.date_from) form.date_from.value = f.date_from;
                     if (f.date_to) form.date_to.value = f.date_to;
+                    if (f.amount_min) form.amount_min.value = f.amount_min;
+                    if (f.amount_max) form.amount_max.value = f.amount_max;
                 }
             } catch(e) {}
         }
@@ -512,7 +728,9 @@ function sortAuditTable(th) {
         localStorage.setItem('audit_filters', JSON.stringify({
             church_id: this.church_id.value,
             date_from: this.date_from.value,
-            date_to: this.date_to.value
+            date_to: this.date_to.value,
+            amount_min: this.amount_min.value,
+            amount_max: this.amount_max.value
         }));
     });
 })();

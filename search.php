@@ -49,27 +49,12 @@ if (empty($exp_types)) { $exp_types = [-1]; }
 $exp_types_str = implode(',', array_map('intval', array_filter($exp_types, 'is_numeric')));
 if (empty($exp_types_str)) { $exp_types_str = '-1'; }
 
-// Church list - restrict to accessible churches for non-admin
+// Church list - for admin dropdown
 $churches = [];
 if (is_admin()) {
     $ch_res = $conn->query("SELECT id, name FROM ots.churches WHERE name IS NOT NULL AND name != '' ORDER BY name ASC");
     if ($ch_res) {
         while ($ch = $ch_res->fetch_assoc()) { $churches[] = $ch; }
-    }
-} else {
-    $allowed = get_accessible_church_ids();
-    $allowed = array_values(array_filter(array_map('intval', $allowed), function ($v) { return $v > 0; }));
-    if (!empty($allowed)) {
-        $placeholders = implode(',', array_fill(0, count($allowed), '?'));
-        $ch_sql = "SELECT id, name FROM ots.churches WHERE id IN ($placeholders) ORDER BY name ASC";
-        $ch_stmt = $conn->prepare($ch_sql);
-        if ($ch_stmt) {
-            $types = str_repeat('i', count($allowed));
-            $ch_stmt->bind_param($types, ...$allowed);
-            $ch_stmt->execute();
-            $ch_res = $ch_stmt->get_result();
-            if ($ch_res) { while ($ch = $ch_res->fetch_assoc()) { $churches[] = $ch; } }
-        }
     }
 }
 
@@ -79,7 +64,13 @@ $source_whitelist = ['bank', 'ots', 'both'];
 if (!in_array($source, $source_whitelist, true)) {
     $source = 'bank';
 }
-$church_id = isset($_GET['church_id']) ? intval($_GET['church_id']) : 0;
+if (isset($_GET['church_id'])) {
+    $church_id = intval($_GET['church_id']);
+} elseif (!is_admin() && isset($_SESSION['revizor_selected_church']) && $_SESSION['revizor_selected_church'] > 0) {
+    $church_id = intval($_SESSION['revizor_selected_church']);
+} else {
+    $church_id = 0;
+}
 // if a church is requested, ensure the user has access
 if ($church_id > 0) {
     require_church_access($church_id);
@@ -345,7 +336,7 @@ try {
             }
         }
 
-        $select_cols = "T.RECORD_ID, T.CASH_DOCUMENT_NUMBER, T.DECISION_NUMBER, T.DATETIME,
+        $select_cols = "T.RECORD_ID, T.CHURCH_ID, T.CASH_DOCUMENT_NUMBER, T.DECISION_NUMBER, T.DATETIME,
                         $adjusted_sql AS adjusted_amount,
                         TRIM(CONCAT(IFNULL(CONCAT_WS(' ', p.NAME_PREFIX, p.NAME, p.NAME_SUFFIX), ''),
                             ' ', IFNULL(nt1.NAME, ''), ' ', IFNULL(nt2.NAME, ''))) AS ots_desc_full,
@@ -414,16 +405,25 @@ try {
 
 // === EXPORT CSV ===
 if ($export && $has_search) {
+    function export_csv_safe_cell($value) {
+        $value = (string)$value;
+        $value = preg_replace('/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/u', ' ', $value);
+        if ($value !== '' && preg_match('/^[=+\-@]/', $value)) {
+            $value = "'" . $value;
+        }
+        return $value;
+    }
+
     header('Content-Type: text/csv; charset=utf-8');
     header('Content-Disposition: attachment; filename="tranzakcio_kereses.csv"');
     $out = fopen('php://output', 'w');
     fprintf($out, chr(0xEF) . chr(0xBB) . chr(0xBF)); // BOM
 
     if ($source === 'bank' || $source === 'both') {
-        fputcsv($out, ['Forrás', 'Dátum', 'Összeg', 'Közlemény', 'Gyülekezet', 'Kezdeményező', 'Státusz', 'OTS Bizonylat', 'Banki azonosító']);
+        fputcsv($out, array_map('export_csv_safe_cell', ['Forrás', 'Dátum', 'Összeg', 'Közlemény', 'Gyülekezet', 'Kezdeményező', 'Státusz', 'OTS Bizonylat', 'Banki azonosító']));
         foreach ($results as $r) {
             if ($r['_source'] !== 'Bank') continue;
-            fputcsv($out, [
+            fputcsv($out, array_map('export_csv_safe_cell', [
                 'Bank',
                 $r['bank_date'] ?? '',
                 number_format(floatval($r['bank_amount'] ?? 0), 0, ',', ' ') . ' Ft',
@@ -433,17 +433,17 @@ if ($export && $has_search) {
                 $r['status'] ?? '',
                 $r['ots_doc'] ?? '',
                 $r['bank_ext_ref'] ?? '',
-            ]);
+            ]));
         }
     }
     if ($source === 'ots' || $source === 'both') {
         if ($source === 'both') {
             fputcsv($out, []);
         }
-        fputcsv($out, ['Forrás', 'Dátum', 'Összeg', 'Leírás', 'Gyülekezet', 'Forgalom', 'Típus', 'Bizonylatszám', 'Határozati szám']);
+        fputcsv($out, array_map('export_csv_safe_cell', ['Forrás', 'Dátum', 'Összeg', 'Leírás', 'Gyülekezet', 'Forgalom', 'Típus', 'Bizonylatszám', 'Határozati szám']));
         foreach ($results as $r) {
             if ($r['_source'] !== 'OTS') continue;
-            fputcsv($out, [
+            fputcsv($out, array_map('export_csv_safe_cell', [
                 'OTS',
                 $r['bank_date'] ?? '',
                 number_format(floatval($r['adjusted_amount'] ?? 0), 0, ',', ' ') . ' Ft',
@@ -453,7 +453,7 @@ if ($export && $has_search) {
                 $r['ots_type_name'] ?? '',
                 $r['CASH_DOCUMENT_NUMBER'] ?? '',
                 $r['DECISION_NUMBER'] ?? '',
-            ]);
+            ]));
         }
     }
     fclose($out);
@@ -471,7 +471,7 @@ $total_pages = $total > 0 ? ceil($total / $per_page) : 0;
 <html lang="hu">
 <head>
     <meta charset="UTF-8">
-    <title>Revizor Asszisztens 1.0 – Tranzakció Kereső</title>
+    <title>🕵️ Revizor Asszisztens 1.0 – Tranzakció Kereső</title>
     <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
     <style>
         body { background: #f8f9fa; padding: 15px; font-size: 14px; }
@@ -495,14 +495,16 @@ $total_pages = $total > 0 ? ceil($total / $per_page) : 0;
 
     <div class="d-flex justify-content-between align-items-center mb-3 px-3 py-2 bg-white rounded border shadow-sm">
         <div class="d-flex align-items-center gap-2">
+            <a href="index.php" class="btn btn-outline-secondary btn-sm">🏠 Kezdőlap</a>
             <span class="fw-bold">🕵️ Revizor Asszisztens 1.0</span>
             <span class="text-muted mx-1">|</span>
             <span class="text-muted">Tranzakció Kereső</span>
         </div>
         <div class="d-flex align-items-center gap-1">
-            <a href="index.php" class="btn btn-outline-secondary btn-sm">🏠 Kezdőlap</a>
             <a href="help.php" class="btn btn-outline-primary btn-sm">❓ Súgó</a>
-            <a href="logout.php" class="btn btn-outline-danger btn-sm ms-1">Kilépés</a>
+            <?php render_dev_toggle(); ?>
+            <?php render_user_badge(); ?>
+            <a href="logout.php" class="btn btn-outline-danger btn-sm">Kilépés</a>
         </div>
     </div>
 
@@ -522,12 +524,26 @@ $total_pages = $total > 0 ? ceil($total / $per_page) : 0;
             </div>
             <div class="col-md-3">
                 <label class="form-label small mb-0">Gyülekezet</label>
+                <?php if (is_admin()): ?>
                 <select name="church_id" class="form-select form-select-sm">
                     <option value="0">Összes</option>
                     <?php foreach ($churches as $ch): ?>
                     <option value="<?= $ch['id'] ?>" <?= $church_id === intval($ch['id']) ? 'selected' : '' ?>><?= htmlspecialchars($ch['name']) ?></option>
                     <?php endforeach; ?>
                 </select>
+                <?php else: ?>
+                <input type="hidden" name="church_id" value="<?= $church_id ?>">
+                <span class="form-control form-control-sm bg-light" style="width:100%;display:inline-block;border:1px solid #dee2e6;padding:4px 8px;border-radius:4px;">
+                    🏛 <?php
+                        $ch_name = '';
+                        if ($church_id > 0) {
+                            $nstmt = $conn->prepare("SELECT name FROM ots.churches WHERE id = ?");
+                            if ($nstmt) { $nstmt->bind_param('i', $church_id); $nstmt->execute(); $nres = $nstmt->get_result(); if ($nres && $nr = $nres->fetch_assoc()) { $ch_name = $nr['name']; } }
+                        }
+                        echo htmlspecialchars($ch_name ?: '#' . $church_id);
+                    ?>
+                </span>
+                <?php endif; ?>
             </div>
             <div class="col-md-2">
                 <label class="form-label small mb-0">Összeg (min)</label>
@@ -640,7 +656,7 @@ document.getElementById('query_info').textContent = '<?= $has_search ? ($error_m
                             <?php if ($r['_source'] === 'Bank'): ?>
                                 <a href="reconciliation.php?bank_id=<?= intval($r['id']) ?>" class="btn btn-outline-primary btn-sm py-0 px-1" title="Egyeztetés">⚡</a>
                             <?php elseif ($r['_source'] === 'OTS'): ?>
-                                <a href="all_transactions/all_transactions_multi.php?record_id=<?= intval($r['RECORD_ID']) ?>" class="btn btn-outline-secondary btn-sm py-0 px-1" target="_blank" title="OTS megnyitása">🔗</a>
+                                <a href="all_transactions/all_transactions_multi.php?record_id=<?= intval($r['RECORD_ID']) ?>&church_id=<?= intval($r['CHURCH_ID']) ?>" class="btn btn-outline-secondary btn-sm py-0 px-1" target="_blank" title="OTS megnyitása">🔗</a>
                             <?php endif; ?>
                         </td>
                         <?php if ($church_id === 0): ?><td><?= htmlspecialchars($r['church_name'] ?? '-') ?></td><?php endif; ?>
@@ -685,7 +701,7 @@ document.getElementById('query_info').textContent = '<?= $has_search ? ($error_m
                         <td>
                             <?php if ($r['_source'] === 'Bank'): ?>
                                 <?php if (!empty($r['ots_record_id'])): ?>
-                                    <a href="all_transactions/all_transactions_multi.php?record_id=<?= intval($r['ots_record_id']) ?>" target="_blank" class="text-decoration-none">
+                                    <a href="all_transactions/all_transactions_multi.php?record_id=<?= intval($r['ots_record_id']) ?>&church_id=<?= intval($r['church_id']) ?>" target="_blank" class="text-decoration-none">
                                         #<?= intval($r['ots_record_id']) ?>
                                     </a>
                                     <?php if (!empty($r['ots_doc'])): ?>

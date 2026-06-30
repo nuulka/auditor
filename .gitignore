@@ -13,6 +13,13 @@ config/app.local.php
 Thumbs.db
 .DS_Store
 
+# Python cache
+__pycache__/
+*.pyc
+
+# Uploaded bank statement CSV files
+google_ai_modul/uploads/
+
 # IDE
 .vscode/
 .idea/

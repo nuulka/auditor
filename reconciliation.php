@@ -1068,7 +1068,17 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['
 
     if ($unmatched_search) {
         // Párosítatlan keresés: minden OTS tétel a gyülekezetre +/- 70 napban, ami még nincs felhasználva
-        $start_date = !empty($bank_date) ? date('Y-m-d', strtotime("$bank_date -70 days")) : '1970-01-01';
+        // Banki költségeknél (pl. "Csoportos beszedés díja") nincs értelme a banki dátum előtti OTS tételt keresni
+        $fee_keywords = ['díj', 'költség', 'jutalék', 'banki', 'kezelési', 'szolgáltatási'];
+        $is_fee = false;
+        $fee_search_text = mb_strtolower($bank_desc . ' ' . $bank_ext_name, 'UTF-8');
+        foreach ($fee_keywords as $kw) {
+            if (mb_strpos($fee_search_text, $kw) !== false) {
+                $is_fee = true;
+                break;
+            }
+        }
+        $start_date = !empty($bank_date) ? date('Y-m-d', strtotime($is_fee ? $bank_date : "$bank_date -70 days")) : '1970-01-01';
         $end_date = !empty($bank_date) ? date('Y-m-d', strtotime("$bank_date +70 days")) : date('Y-m-d', strtotime('+70 days'));
 
         $sql = "SELECT T.*,
@@ -1218,6 +1228,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['
     $bank_date_dt = DateTime::createFromFormat('Y-m-d', $bank_date);
     $bank_date = ($bank_date_dt instanceof DateTime && $bank_date_dt->format('Y-m-d') === $bank_date) ? $bank_date : '';
     $bank_amount = isset($_POST['bank_amount']) ? floatval($_POST['bank_amount']) : 0;
+    $custom_keywords = isset($_POST['custom_keywords']) ? json_decode($_POST['custom_keywords'], true) : null;
 
     if ($church_id <= 0 || (empty($bank_desc) && empty($bank_ext_name))) {
         echo json_encode(['status' => 'ERROR', 'message' => 'Hiányzó paraméter']);
@@ -1227,20 +1238,39 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['
     // scope check
     require_church_access($church_id);
 
-    // Kulcsszavak kinyerése a banki közleményből
-    $search_text = $bank_desc . ' ' . $bank_ext_name;
-    $words = preg_split('/[\s,\.\-\/\(\)\[\]":;!?\+]+/u', $search_text, -1, PREG_SPLIT_NO_EMPTY);
-    $keywords = [];
-    foreach ($words as $w) {
-        $w = trim($w);
-        if (mb_strlen($w, 'UTF-8') >= 3) {
-            $keywords[] = $w;
+    // Kulcsszavak kinyerése a banki közleményből (vagy egyéni kulcsszavak használata)
+    if ($custom_keywords && is_array($custom_keywords) && count($custom_keywords) > 0) {
+        $keywords = array_filter($custom_keywords, function($kw) {
+            return mb_strlen(trim($kw), 'UTF-8') >= 1;
+        });
+        $keywords = array_values($keywords);
+    } else {
+        $search_text = $bank_desc . ' ' . $bank_ext_name;
+        $words = preg_split('/[\s,\.\-\/\(\)\[\]":;!?\+]+/u', $search_text, -1, PREG_SPLIT_NO_EMPTY);
+        $keywords = [];
+        foreach ($words as $w) {
+            $w = trim($w);
+            if (mb_strlen($w, 'UTF-8') >= 3) {
+                $keywords[] = $w;
+            }
         }
     }
     if (empty($keywords)) {
         echo json_encode(['status' => 'ERROR', 'message' => 'Nincs értékelhető kulcsszó a közleményben']);
         exit;
     }
+
+    // Banki közlemény szavai a kliensoldali autosuggesthez
+    $bank_words = [];
+    $word_list = preg_split('/[\s,\.\-\/\(\)\[\]":;!?\+]+/u', ($bank_desc . ' ' . $bank_ext_name), -1, PREG_SPLIT_NO_EMPTY);
+    foreach ($word_list as $w) {
+        $w = trim($w);
+        if (mb_strlen($w, 'UTF-8') >= 1) {
+            $bank_words[] = $w;
+        }
+    }
+    $bank_words = array_unique($bank_words);
+    sort($bank_words);
 
     $sign = $bank_amount >= 0 ? '>=' : '<';
     $result = false;
@@ -1258,8 +1288,17 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['
     }
     $like_where = '(' . implode(' OR ', $like_parts) . ')';
 
-    // Dátumablak: ±90 nap
-    $start_date = !empty($bank_date) ? date('Y-m-d', strtotime("$bank_date -90 days")) : '1970-01-01';
+    // Dátumablak: ±90 nap (banki költségnél csak +90 nap)
+    $fee_keywords = ['díj', 'költség', 'jutalék', 'banki', 'kezelési', 'szolgáltatási'];
+    $is_fee = false;
+    $fee_search_text = mb_strtolower($bank_desc . ' ' . $bank_ext_name, 'UTF-8');
+    foreach ($fee_keywords as $kw) {
+        if (mb_strpos($fee_search_text, $kw) !== false) {
+            $is_fee = true;
+            break;
+        }
+    }
+    $start_date = !empty($bank_date) ? date('Y-m-d', strtotime($is_fee ? $bank_date : "$bank_date -90 days")) : '1970-01-01';
     $end_date = !empty($bank_date) ? date('Y-m-d', strtotime("$bank_date +90 days")) : date('Y-m-d', strtotime('+90 days'));
 
     $adjusted_amount_sql = "IF(T.TYPE IN ($exp_types_str), -1 * T.AMOUNT, T.AMOUNT)";
@@ -1328,7 +1367,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['
         });
     }
 
-    echo json_encode(['status' => 'OK', 'data' => $rows, 'church_name' => ($rows[0]['church_name'] ?? ''), 'keywords' => $keywords]);
+    echo json_encode(['status' => 'OK', 'data' => $rows, 'church_name' => ($rows[0]['church_name'] ?? ''), 'keywords' => $keywords, 'bank_words' => $bank_words]);
     exit;
 }
 
@@ -1665,6 +1704,10 @@ $limit = isset($_GET['limit']) && in_array(intval($_GET['limit']), $allowed_limi
 if ($limit >= 999999) { $page = 1; $offset = 0; } else { $offset = ($page - 1) * $limit; }
 
 $selected_church_name = isset($_GET['church_filter']) ? trim($_GET['church_filter']) : '';
+// Ha nincs GET param, de van session-ben tárolt gyülekezet, használjuk azt
+if (empty($selected_church_name) && !empty($_SESSION['revizor_selected_church_name'])) {
+    $selected_church_name = $_SESSION['revizor_selected_church_name'];
+}
 $selected_church_id = -1;
 $auto_bank_id = isset($_GET['bank_id']) ? intval($_GET['bank_id']) : 0;
 
@@ -1962,6 +2005,13 @@ unset($row);
         .sort-asc::after { content: " ↑"; font-size: 10px; color: #0d6efd; }
         .sort-desc::after { content: " ↓"; font-size: 10px; color: #0d6efd; }
 
+        .resize-handle {
+            position: absolute; right: 0; top: 0; bottom: 0;
+            width: 5px; cursor: col-resize; z-index: 5;
+        }
+        .resize-handle:hover,
+        .resize-handle:active { background-color: #0d6efd; }
+
         .status-bar-fixed {
             position: fixed; bottom: 0; left: 0; width: 100%;
             background-color: #212529; color: #f8f9fa;
@@ -2071,6 +2121,7 @@ unset($row);
         <form method="GET" action="reconciliation.php" class="d-flex gap-1 align-items-center">
             <input type="hidden" name="limit" value="<?php echo $limit; ?>">
             <input type="hidden" id="currentChurchId" value="<?php echo $selected_church_id; ?>">
+            <?php if (is_admin()): ?>
             <input list="churchesList" name="church_filter" id="churchSelect" class="form-control church-search-box" placeholder="Válassz gyülekezetet..." value="<?php echo htmlspecialchars($selected_church_name); ?>" onchange="showPerPageLoading(this.form)" autocomplete="off" style="height:31px;">
             <datalist id="churchesList">
                 <?php foreach ($churches as $church): ?>
@@ -2078,8 +2129,15 @@ unset($row);
                 <?php endforeach; ?>
             </datalist>
             <?php if($selected_church_id !== -1): ?><a href="reconciliation.php" class="btn btn-sm btn-outline-danger text-nowrap" title="Szűrés törlése">✕</a><?php endif; ?>
+            <?php else: ?>
+            <span class="form-control bg-light" style="height:31px;width:auto;display:inline-block;border:1px solid #dee2e6;padding:2px 8px;border-radius:4px;line-height:26px;">
+                🏛 <?php echo htmlspecialchars($selected_church_name ?: '#' . $selected_church_id); ?>
+            </span>
+            <?php endif; ?>
         </form>
         <nav class="navbar navbar-light p-0 ms-auto position-relative">
+            <?php render_user_badge(); ?>
+            <?php render_dev_toggle(); ?>
             <button class="navbar-toggler border-0" type="button" data-bs-toggle="collapse" data-bs-target="#actionMenu" aria-label="Menü">
                 <span class="navbar-toggler-icon"></span>
             </button>
@@ -2097,6 +2155,9 @@ unset($row);
     
     <div class="table-responsive-scroll">
         <table class="table table-bordered align-middle m-0" id="sortableTable">
+            <colgroup id="colGroup">
+                <col style="width: 9%"><col style="width: 7%"><col style="width: 9%"><col style="width: 16%"><col style="width: 7%"><col style="width: 8%"><col style="width: 14%"><col style="width: 9%"><col style="width: 9%"><col style="width: 11%"><col style="width: 5%">
+            </colgroup>
             <thead>
                 <tr class="main-header">
                     <th style="background-color: #495057 !important;">ADMIN</th>
@@ -2439,6 +2500,16 @@ unset($row);
                     <button id="toggleMatchModeBtn" class="btn btn-outline-secondary btn-sm" onclick="toggleMatchMode()" type="button" style="display:none;">☐ Több tételes párosítás</button>
                     <button id="aggregationSearchBtn" class="btn btn-outline-info btn-sm" onclick="aggregationSearch()" type="button" style="display:none;">🔍 Keresés szöveg alapján</button>
                 </div>
+            </div>
+            <div id="unmatchedFilterBar" class="d-flex gap-1 mb-1 align-items-center" style="display:none;">
+                <input type="text" id="unmatchedFilterText" class="form-control form-control-sm" style="width:140px;" placeholder="Szöveg szűrés..." oninput="filterUnmatched()">
+                <input type="number" id="unmatchedFilterAmount" class="form-control form-control-sm" style="width:120px;" placeholder="Összeg szűrés..." oninput="filterUnmatched()">
+                <select id="unmatchedSortBy" class="form-select form-select-sm" style="width:auto;" onchange="filterUnmatched()">
+                    <option value="date_asc">📅 Dátum ↑</option>
+                    <option value="date_desc">📅 Dátum ↓</option>
+                    <option value="amount_asc">💰 Összeg ↑</option>
+                    <option value="amount_desc">💰 Összeg ↓</option>
+                </select>
             </div>
             <div id="c_ots_content">
                 <!-- Dinamikusan generált táblázat helye -->
@@ -3015,6 +3086,7 @@ var _currentViewingData = null;
 
 function mutatKombinaltReszleteket(adatok) {
     try {
+    window._unmatchedTransactionsOriginal = null;
     _currentViewingRowId = adatok.id || null;
     _currentViewingData = adatok;
     frissitModalSzamlalot();
@@ -3025,6 +3097,8 @@ function mutatKombinaltReszleteket(adatok) {
     // Bank adatok
     document.getElementById('cb_church_name').textContent = adatok.church_name ? adatok.church_name : '-';
     document.getElementById('cb_date').textContent = adatok.bank_date;
+    document.getElementById('unmatchedFilterText').value = '';
+    document.getElementById('unmatchedFilterAmount').value = '';
     let bankAmtEl = document.getElementById('cb_amount');
     bankAmtEl.textContent = Number(adatok.bank_amount).toLocaleString('hu-HU') + ' Ft';
     bankAmtEl.className = adatok.bank_amount < 0 ? 'fw-bold text-danger' : 'fw-bold text-success';
@@ -3174,16 +3248,10 @@ function renderOtsResults(result, adatok, keywords) {
 
     let html = '';
     if (result.unmatched_search) {
+        document.getElementById('unmatchedFilterBar').style.display = 'flex';
         html += '<div class="alert alert-info text-center py-1 small mb-1">🔍 Párosítatlan OTS tételek a banki dátum körüli ±70 napban — válaszd ki a megfelelőt!</div>';
-        html += '<div class="d-flex gap-1 mb-1 align-items-center">' +
-            '<input type="number" id="unmatchedFilterAmount" class="form-control form-control-sm" style="width:120px;" placeholder="Összeg szűrés..." oninput="filterUnmatched()">' +
-            '<select id="unmatchedSortBy" class="form-select form-select-sm" style="width:auto;" onchange="filterUnmatched()">' +
-                '<option value="date_asc">📅 Dátum ↑</option>' +
-                '<option value="date_desc">📅 Dátum ↓</option>' +
-                '<option value="amount_asc">💰 Összeg ↑</option>' +
-                '<option value="amount_desc">💰 Összeg ↓</option>' +
-            '</select>' +
-        '</div>';
+    } else {
+        document.getElementById('unmatchedFilterBar').style.display = 'none';
     }
     if (result.from_existing) {
         html += '<div class="alert alert-success text-center py-1 small mb-1">✅ Már párosított OTS tételek — a meglévő párosítás alább látható</div>';
@@ -3202,9 +3270,12 @@ function renderOtsResults(result, adatok, keywords) {
         const isExactMatch = otsDate === bankDate && Math.abs(adjAmount - bankAmt) < 0.01;
         const isAmountMatch = Math.abs(adjAmount - bankAmt) < 0.01;
 
+        // Meglévő párosításnál az első tételt se bontsuk ki (több tételes tizedcédula)
+        const collapsed = result.from_existing ? true : !isFirst;
+
         html += '<div class="accordion-item ' + (isExactMatch ? 'border-success' : isAmountMatch ? 'border-warning' : '') + '">' +
             '<h2 class="accordion-header">' +
-                    '<button class="accordion-button ' + (isFirst ? '' : 'collapsed') + '" type="button" data-bs-toggle="collapse" data-bs-target="#' + txId + '" aria-expanded="' + isFirst + '">' +
+                    '<button class="accordion-button ' + (collapsed ? 'collapsed' : '') + '" type="button" data-bs-toggle="collapse" data-bs-target="#' + txId + '" aria-expanded="' + (!collapsed) + '">' +
                     (result.from_existing ?
                     '<span class="badge bg-success me-2">✅ Párosított</span>' :
                     '<input type="radio" name="otsSelect" class="form-check-input me-2 radio-input" value="' + idx + '" data-doc="' + (tx.CASH_DOCUMENT_NUMBER || '') + '" data-record-id="' + recordId + '" data-date="' + (tx.DATETIME || '') + '" data-amount="' + adjAmount + '" ' + (isExactMatch || isFirst ? 'checked' : '') + ' onclick="event.stopPropagation();">') +
@@ -3217,7 +3288,7 @@ function renderOtsResults(result, adatok, keywords) {
                     '<small class="text-muted text-truncate" style="max-width: 200px;">' + otsDesc + '</small>' +
                 '</button>' +
             '</h2>' +
-            '<div id="' + txId + '" class="accordion-collapse collapse ' + (isFirst ? 'show' : '') + '" data-bs-parent="#otsAccordion">' +
+            '<div id="' + txId + '" class="accordion-collapse collapse ' + (collapsed ? '' : 'show') + '" data-bs-parent="#otsAccordion">' +
                 '<div class="accordion-body p-0">' +
                     '<table class="table table-sm table-striped table-bordered m-0">';
 
@@ -3289,6 +3360,16 @@ function renderOtsResults(result, adatok, keywords) {
     });
 
     html += '</div>';
+
+    // Összegzés sor meglévő párosításoknál (több tételes tizedcédula)
+    if (result.from_existing && transactions.length > 1) {
+        var sum = 0;
+        transactions.forEach(function(tx) { sum += Number(tx.adjusted_amount || tx.AMOUNT || 0); });
+        html += '<div class="text-center fw-bold py-1 border-top bg-light">' +
+            'Összesen: <span class="' + (sum < 0 ? 'text-danger' : 'text-success') + '">' + sum.toLocaleString('hu-HU') + ' Ft</span>' +
+        '</div>';
+    }
+
     html += '<div id="multiSumBar" class="text-center fw-bold py-1" style="display:none;">' +
         'Kiválasztva: <span id="multiCount">0</span> tétel, ' +
         'összesen: <span id="multiSumAmount">0 Ft</span>' +
@@ -3306,6 +3387,9 @@ function renderOtsResults(result, adatok, keywords) {
         window._unmatchedTransactions = transactions.slice();
         window._unmatchedResult = result;
         window._unmatchedAdatok = adatok;
+        if (!window._unmatchedTransactionsOriginal) {
+            window._unmatchedTransactionsOriginal = transactions.slice();
+        }
     }
 
     document.querySelectorAll('#otsAccordion .radio-input').forEach(function(r) {
@@ -3318,13 +3402,28 @@ function renderOtsResults(result, adatok, keywords) {
 
 function filterUnmatched() {
     if (!window._unmatchedTransactions || !window._unmatchedAdatok) return;
+    var filterText = document.getElementById('unmatchedFilterText');
     var filterVal = document.getElementById('unmatchedFilterAmount');
     var sortVal = document.getElementById('unmatchedSortBy');
-    if (!filterVal || !sortVal) return;
+    if (!filterText || !filterVal || !sortVal) return;
+    var textQuery = filterText.value.trim().toLowerCase();
     var targetAmount = parseFloat(filterVal.value);
     var sortMode = sortVal.value;
 
-    var data = window._unmatchedTransactions.slice();
+    var data = (window._unmatchedTransactionsOriginal || window._unmatchedTransactions).slice();
+
+    if (textQuery.length > 0) {
+        data = data.filter(function(tx) {
+            var desc = (tx.ots_desc_full || '').toLowerCase();
+            var fund = (tx.fund_name || '').toLowerCase();
+            var type = (tx.ots_type_name || '').toLowerCase();
+            var doc = (tx.CASH_DOCUMENT_NUMBER || '').toLowerCase();
+            return desc.indexOf(textQuery) !== -1 ||
+                   fund.indexOf(textQuery) !== -1 ||
+                   type.indexOf(textQuery) !== -1 ||
+                   doc.indexOf(textQuery) !== -1;
+        });
+    }
 
     if (!isNaN(targetAmount)) {
         data = data.filter(function(tx) {
@@ -3354,7 +3453,65 @@ function filterUnmatched() {
     renderOtsResults(newResult, window._unmatchedAdatok);
 }
 
-function aggregationSearch() {
+var _aggCurrentKeywords = [];
+var _aggBankWords = [];
+
+function _aggRenderChips(keywords) {
+    var h = '<div class="d-flex flex-wrap gap-1 mb-2" id="aggChips">';
+    keywords.forEach(function(kw, i) {
+        h += '<span class="badge bg-info text-dark d-inline-flex align-items-center gap-1" style="font-size:0.85rem;">' +
+            _aggEs(kw) +
+            ' <a href="#" onclick="event.preventDefault(); _aggRemoveKeyword(' + i + '); return false;" style="color:inherit;text-decoration:none;font-weight:bold;cursor:pointer;">&times;</a>' +
+        '</span>';
+    });
+    h += '</div>';
+    return h;
+}
+
+function _aggEs(s) { return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+
+function _aggRemoveKeyword(idx) {
+    _aggCurrentKeywords.splice(idx, 1);
+    document.getElementById('aggChips').outerHTML = _aggRenderChips(_aggCurrentKeywords);
+}
+
+function _aggAddKeyword() {
+    var input = document.getElementById('aggNewKwInput');
+    var kw = input.value.trim();
+    if (kw.length === 0) return;
+    _aggCurrentKeywords.push(kw);
+    input.value = '';
+    document.getElementById('aggChips').outerHTML = _aggRenderChips(_aggCurrentKeywords);
+}
+
+function _aggRunSearch() {
+    aggregationSearch(_aggCurrentKeywords);
+}
+
+function _aggBackToUnmatched() {
+    _aggCurrentKeywords = [];
+    _aggBankWords = [];
+    loadUnmatched();
+}
+
+function _aggRenderEditor(keywords, bankWords) {
+    var h = '<div class="keyword-editor border rounded p-2 mb-2 bg-light">';
+    h += '<label class="small fw-bold mb-1">Kulcsszavak:</label>';
+    h += _aggRenderChips(keywords);
+    h += '<div class="input-group input-group-sm">';
+    h += '<input type="text" id="aggNewKwInput" class="form-control" list="aggKwSuggest" placeholder="Új kulcsszó…" onkeydown="if(event.key===\'Enter\'){event.preventDefault();_aggAddKeyword();}">';
+    h += '<datalist id="aggKwSuggest">';
+    bankWords.forEach(function(w) {
+        if (w.length >= 1) h += '<option value="' + _aggEs(w) + '">';
+    });
+    h += '</datalist>';
+    h += '<button class="btn btn-outline-secondary" onclick="_aggAddKeyword()">+ Hozzáad</button>';
+    h += '<button class="btn btn-primary" onclick="_aggRunSearch()">🔍 Keresés</button>';
+    h += '</div></div>';
+    return h;
+}
+
+function aggregationSearch(customKeywords) {
     var adatok = _currentViewingData;
     if (!adatok) return;
 
@@ -3362,6 +3519,7 @@ function aggregationSearch() {
     var otsEmpty = document.getElementById('c_ots_empty');
     otsEmpty.style.display = 'none';
     otsContainer.style.display = 'block';
+    document.getElementById('unmatchedFilterBar').style.display = 'none';
     otsContainer.innerHTML = '<div class="text-center py-4"><span class="spinner-border spinner-border-sm me-2"></span>Szöveges keresés a kulcsszavak alapján...</div>';
 
     var data = new FormData();
@@ -3372,25 +3530,42 @@ function aggregationSearch() {
     data.append('bank_date', adatok.bank_date || '');
     data.append('bank_amount', adatok.bank_amount || 0);
     data.append('csrf_token', CSRF_TOKEN);
+    if (customKeywords && customKeywords.length > 0) {
+        data.append('custom_keywords', JSON.stringify(customKeywords));
+    }
 
     fetch('reconciliation.php', { method: 'POST', body: data })
     .then(function(res) { return res.json(); })
     .then(function(result) {
+        var keywords = result.keywords || [];
+        var bankWords = result.bank_words || [];
+
         if (result.status !== 'OK' || !result.data || result.data.length === 0) {
+            _aggCurrentKeywords = keywords;
+            _aggBankWords = bankWords;
             otsContainer.style.display = 'none';
             otsEmpty.style.display = 'block';
-            otsEmpty.innerHTML = '<strong>[Nincs találat]</strong><br>Egyetlen OTS tétel sem tartalmazza a közlemény kulcsszavait.<br><small>Kulcsszavak: ' + (result.keywords || []).join(', ') + '</small><div class="mt-2"><button class="btn btn-outline-info btn-sm" onclick="aggregationSearch()" type="button">🔍 Új keresés</button></div>';
+            otsEmpty.innerHTML = '<strong>[Nincs találat]</strong><br>Egyetlen OTS tétel sem tartalmazza a közlemény kulcsszavait.' +
+                '<div class="mt-2 mb-2"><button class="btn btn-outline-secondary btn-sm" onclick="_aggBackToUnmatched()">← Vissza a párosítatlan listához</button></div>' +
+                _aggRenderEditor(keywords, bankWords);
             return;
         }
         var transactions = result.data;
+        _aggCurrentKeywords = keywords;
+        _aggBankWords = bankWords;
         var bankAmt = Number(adatok.bank_amount);
         var bankDate = adatok.bank_date || '';
 
         document.getElementById('toggleMatchModeBtn').style.display = '';
-        document.getElementById('aggregationSearchBtn').style.display = 'none';
+    document.getElementById('aggregationSearchBtn').style.display = 'none';
+    document.getElementById('unmatchedFilterBar').style.display = 'none';
 
         var html = '';
-        html += '<div class="alert alert-info text-center py-1 small mb-1">🔍 Szöveges keresés találatai (<strong>' + result.keywords.join(', ') + '</strong>) — ' + transactions.length + ' db</div>';
+        html += '<div class="d-flex justify-content-between align-items-center mb-1">' +
+            '<button class="btn btn-outline-secondary btn-sm" onclick="_aggBackToUnmatched()">← Vissza</button>' +
+            '<span class="alert alert-info text-center py-1 small mb-0 flex-grow-1 ms-2">🔍 Szöveges keresés találatai — ' + transactions.length + ' db</span>' +
+        '</div>';
+        html += _aggRenderEditor(keywords, bankWords);
         html += '<div class="accordion" id="otsAccordion">';
 
         transactions.forEach(function(tx, idx) {
@@ -4335,6 +4510,69 @@ setInterval(() => {
         window.location.href = 'logout.php';
     }
 }, 1000);
+
+// --- Oszlopátméretezés húzással + sessionStorage ---
+(function() {
+    var TABLE_ID = 'sortableTable';
+    var STORAGE_KEY = 'revizor_col_widths';
+    var colGroup = document.getElementById('colGroup');
+    var cols = colGroup ? colGroup.children : [];
+    var headers = document.querySelectorAll('#' + TABLE_ID + ' .sub-header th');
+    if (!colGroup || !cols.length || !headers.length) return;
+
+    try {
+        var saved = JSON.parse(sessionStorage.getItem(STORAGE_KEY));
+        if (saved && saved.length === cols.length) {
+            for (var ci = 0; ci < cols.length; ci++) {
+                if (saved[ci]) cols[ci].style.width = saved[ci];
+            }
+        }
+    } catch (e) {}
+
+    var dragState = null;
+
+    function colResizeStart(e, colIndex) {
+        e.preventDefault();
+        var startX = e.clientX;
+        var startWidth = cols[colIndex].offsetWidth;
+        var tableWidth = colGroup.parentElement.offsetWidth;
+        dragState = { colIndex: colIndex, startX: startX, startWidth: startWidth, tableWidth: tableWidth };
+        document.body.style.cursor = 'col-resize';
+        document.body.style.userSelect = 'none';
+    }
+
+    function colResizeMove(e) {
+        if (!dragState) return;
+        var dx = e.clientX - dragState.startX;
+        var newPx = Math.max(30, dragState.startWidth + dx);
+        var pct = (newPx / dragState.tableWidth * 100).toFixed(1);
+        cols[dragState.colIndex].style.width = pct + '%';
+    }
+
+    function colResizeEnd() {
+        if (!dragState) return;
+        document.body.style.cursor = '';
+        document.body.style.userSelect = '';
+        var widths = [];
+        for (var si = 0; si < cols.length; si++) {
+            widths.push(cols[si].style.width);
+        }
+        try { sessionStorage.setItem(STORAGE_KEY, JSON.stringify(widths)); } catch (e) {}
+        dragState = null;
+    }
+
+    for (var hi = 0; hi < headers.length - 1; hi++) {
+        var handle = document.createElement('div');
+        handle.className = 'resize-handle';
+        (function(idx) {
+            handle.addEventListener('mousedown', function(e) { colResizeStart(e, idx); });
+        })(hi);
+        headers[hi].appendChild(handle);
+    }
+
+    document.addEventListener('mousemove', colResizeMove);
+    document.addEventListener('mouseup', colResizeEnd);
+})();
 </script>
 
 </body>
