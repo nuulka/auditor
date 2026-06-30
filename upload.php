@@ -395,7 +395,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                         <form method='POST' enctype='multipart/form-data' style='display:inline'>
                             <input type='hidden' name='csrf_token' value='" . htmlspecialchars($_SESSION['csrf_token']) . "'>
                             <input type='hidden' name='single_upload' value='1'>
-                            <input type='hidden' name='church_search' value='" . htmlspecialchars($church_input) . "'>
+                            <input type='hidden' name='church_search' value='" . htmlspecialchars($church_input, ENT_QUOTES, 'UTF-8') . "'>
                             <input type='hidden' name='force_upload' value='1'>
                             <input type='hidden' name='MAX_FILE_SIZE' value='" . (50*1024*1024) . "'>
                             <button type='submit' class='btn btn-warning'>Mégis feltöltöm</button>
@@ -1529,7 +1529,7 @@ document.addEventListener('DOMContentLoaded', function() {
     <div id="progressPanel" class="mt-3 border rounded p-3 bg-light" style="display:none;"></div>
 
     <div class="mt-3 small text-end">
-        <a href="#" onclick="if(confirm('Biztosan törlöd az összes banki rekordot?')){var f=document.createElement('form');f.method='POST';f.action='database/reset.php';var t1=document.createElement('input');t1.type='hidden';t1.name='csrf_token';t1.value='<?php echo htmlspecialchars($_SESSION['csrf_token']); ?>';f.appendChild(t1);var t2=document.createElement('input');t2.type='hidden';t2.name='confirm';t2.value='1';f.appendChild(t2);document.body.appendChild(f);f.submit();}return false;" class="text-decoration-none text-muted">🧹 Adatbázis reset</a>
+        <a href="#" onclick="if(confirm('Biztosan törlöd az összes banki rekordot?')){var f=document.createElement('form');f.method='POST';f.action='database/reset.php';var t1=document.createElement('input');t1.type='hidden';t1.name='csrf_token';t1.value='<?php echo htmlspecialchars($_SESSION['csrf_token'], ENT_QUOTES, 'UTF-8'); ?>';f.appendChild(t1);var t2=document.createElement('input');t2.type='hidden';t2.name='confirm';t2.value='1';f.appendChild(t2);document.body.appendChild(f);f.submit();}return false;" class="text-decoration-none text-muted">🧹 Adatbázis reset</a>
     </div>
 
     <?php else: ?>

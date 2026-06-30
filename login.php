@@ -11,21 +11,6 @@ if (PHP_SAPI !== 'cli' && !headers_sent()) {
     ]);
 }
 
-// Debug session endpoint — shows raw session state (remove after diagnosis)
-if (isset($_GET['debug_session'])) {
-    header('Content-Type: application/json');
-    if (session_status() != PHP_SESSION_ACTIVE) { session_start(); }
-    require_once __DIR__ . '/../ots/session_handler.php';
-    echo json_encode([
-        'session_id' => session_id(),
-        'has_gc_login_cookie' => isset($_SESSION[GC_LOGIN_COOKIE]),
-        'has_revizor_app_role' => isset($_SESSION['revizor_app_role']),
-        'session_keys' => array_keys($_SESSION),
-        'gc_login_cookie_value' => isset($_SESSION[GC_LOGIN_COOKIE]) ? $_SESSION[GC_LOGIN_COOKIE] : null,
-    ]);
-    exit;
-}
-
 // AJAX session check endpoint — must run before session_destroy
 if (isset($_GET['check'])) {
     header('Content-Type: application/json');

@@ -479,7 +479,7 @@ function openAudit(bankRecId) {
             var cb = document.getElementById('chk_' + f);
             if (cb) cb.checked = data.audit && data.audit[f] == 1;
         });
-        document.querySelector('[name="inspector_name"]').value = data.audit ? data.audit.inspector_name : '<?= htmlspecialchars($_SESSION[GC_USER_FULL_NAME] ?? '') ?>';
+        document.querySelector('[name="inspector_name"]').value = data.audit ? data.audit.inspector_name : '<?= htmlspecialchars($_SESSION[GC_USER_FULL_NAME] ?? '', ENT_QUOTES, 'UTF-8') ?>';
         document.querySelector('[name="notes"]').value = data.audit ? data.audit.notes : '';
         
         auditModal.show();

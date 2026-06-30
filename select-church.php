@@ -27,6 +27,19 @@ ensure_revizor_csrf_token();
 $accessible = get_accessible_church_ids();
 $ots = get_ots_conn();
 
+/** Csak relatív (biztonságos) átirányítást engedélyez */
+function safe_redirect(string $url): string {
+    $parsed = parse_url($url);
+    if ($parsed === false) return 'index.php';
+    // Ha van scheme vagy host, eldobjuk – csak relatív URL-t engedünk
+    if (isset($parsed['scheme']) || isset($parsed['host'])) return 'index.php';
+    // Csak a megengedett fájlokra irányíthatunk
+    $allowed = ['index.php', 'help.php', 'upload.php', 'document_check.php', 'search.php', 'reconciliation.php', 'select-church.php', 'all_transactions/all_transactions_multi.php', 'match_progress.php'];
+    $path = $parsed['path'] ?? '';
+    $path = ltrim($path, '/');
+    return in_array($path, $allowed, true) ? $url : 'index.php';
+}
+
 // Ha már van kiválasztva gyülekezet, és itt a change param, töröljük
 if (isset($_GET['change']) && isset($_SESSION['revizor_selected_church'])) {
     unset($_SESSION['revizor_selected_church'], $_SESSION['revizor_selected_church_name']);
@@ -47,7 +60,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['church_id'])) {
             }
         }
     }
-    $redirect = isset($_POST['redirect']) ? $_POST['redirect'] : 'index.php';
+    $redirect = isset($_POST['redirect']) ? safe_redirect($_POST['redirect']) : 'index.php';
     header("Location: $redirect");
     exit;
 }
@@ -81,7 +94,7 @@ if (empty($churches)) {
     exit;
 }
 
-$redirect_to = isset($_GET['redirect']) ? $_GET['redirect'] : 'index.php';
+$redirect_to = isset($_GET['redirect']) ? safe_redirect($_GET['redirect']) : 'index.php';
 ?>
 <!DOCTYPE html>
 <html lang="hu">

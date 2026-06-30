@@ -2801,7 +2801,7 @@ function toggleAuditPanel() {
                 var bankInOts = document.getElementById('chk_bank_in_ots_ok');
                 if (bankInOts) bankInOts.checked = true;
             }
-            document.querySelector('#auditForm [name="inspector_name"]').value = data.audit ? data.audit.inspector_name : '<?php echo htmlspecialchars($_SESSION[GC_USER_FULL_NAME] ?? ''); ?>';
+            document.querySelector('#auditForm [name="inspector_name"]').value = data.audit ? data.audit.inspector_name : '<?php echo htmlspecialchars($_SESSION[GC_USER_FULL_NAME] ?? '', ENT_QUOTES, 'UTF-8'); ?>';
             document.querySelector('#auditForm [name="notes"]').value = data.audit ? data.audit.notes : '';
             document.getElementById('auditSaveMsg').innerHTML = data.audit ? '<span class="text-success">✓ Mentve: ' + (data.audit.checked_at || '') + '</span>' : '';
         })
